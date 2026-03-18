@@ -1,0 +1,3 @@
+#   Markov Decision Process (MDP)
+
+#   Model   =>  predict next state & reward of agent

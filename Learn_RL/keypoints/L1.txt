@@ -1,0 +1,45 @@
+#   Agent       =>  Agent is the learner and decision maker
+    - Agent interacts with the environment by taking actions on it
+    - Action (A)
+    - Collect as much rewards as possible
+
+#   Enviroment  =>  Enviroment in return gives back the agent an observation and a reward
+    - Observation (O)
+    - Reward (R)
+
+#   Cycle   =>  O1, A1, O2, R2, A2, O3, R3, A3, ... A_t, R_t+1, O_t+1, ...
+
+#   Episodic Task   =>  cycle stops at particular point
+    Continuing Task =>  cycle will never stop
+
+#   Policy  =>  Determines the behaviour of agent in environment (how agent is going to behave in environment)
+    i/p -> policy -> o/p
+
+    - what actions are more promising 
+
+#   Value   =>  Estimated return of the observation
+
+#   once agent has all rewards -> accurately calculate retun of every observation (value function is updated)
+
+#   ----    Enviroment    ----
+    State (S)   =>  affected by the agent / external factors
+    - agent don't know about state of envi. (state is completely hidden from agent)
+    - agent only estimate the state of envi.
+    - Fully Observable  =>  agent can make out exact state from observation itself (eg. chess)
+    - Partially Observable  =>  agent can't make out exact state from observation (eg. self driving cars)
+
+#   ----    Rewards    ----
+    - results of the actions
+    - Positive Rewards & Negative Rewards
+
+#   ----    Policy    ----
+    - Simple mapping from states to actions (to be taken on the states)
+    - written as pi
+    - Two Types:
+        - Deterministic =>  take state and retun action to be taken 
+        - Stochastic    =>  take state & retun probability of all actions in the problem
+
+#   ----    Value    ----
+    - Estimate retuns that can be gained by following a policy
+    - Rewards   =>  what good for agent in imediate scence
+    - Value     =>  what good for agent in long run
