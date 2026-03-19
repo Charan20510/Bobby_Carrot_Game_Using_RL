@@ -4,13 +4,7 @@ import pickle as pkl
 import cv2
 
 from show_pannel import initialize_frame, put_agent
-
-
-def epsi_greedy_policy(state, epsi=0.0):
-    action = int(np.argmax(q_table[state]))
-    if np.random.random() <= epsi:
-        action = int(np.random.randint(low=0, high=1))
-    return action
+from sarsa import epsi_greedy_policy
 
 
 cliffEnv = gymnasium.make("CliffWalking-v0")
@@ -32,7 +26,7 @@ for episode in range(NUM_EPISODES):
         cv2.imshow("Cliff Walking", frame2)
         cv2.waitKey(250)
 
-        action = epsi_greedy_policy(state=state)
+        action = epsi_greedy_policy(state=state, q_table=q_table)
         state, reward, terminated, truncated, info = cliffEnv.step(action=action)
         total_reward += reward
         episode_length += 1
