@@ -6,9 +6,10 @@ import pickle
 import sys
 import argparse
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
@@ -42,6 +43,10 @@ class QLearningConfig:
     curriculum: bool = True
     curriculum_max_level: int = 5
     curriculum_step_episodes: int = 1500
+    curriculum_adaptive: bool = True
+    curriculum_promotion_window: int = 100
+    curriculum_promotion_success: float = 0.9
+    curriculum_level_up_epsilon: float = 0.15
     debug_env: bool = False
     debug_every: int = 100
     model_path: Path = Path(__file__).resolve().parent / "q_table_bobby.pkl"
@@ -51,8 +56,29 @@ def _obs_key(env: BobbyCarrotEnv, obs: np.ndarray) -> Tuple[int, ...]:
     return env.observation_to_key(obs)
 
 
+def _select_greedy_action(
+    q_table: Dict[Any, np.ndarray],
+    state_key: Tuple[int, ...],
+    action_space_n: int,
+) -> int:
+    # Support both tuple keys and legacy byte-encoded keys from old checkpoints.
+    q_values = q_table.get(state_key)
+    if q_values is None:
+        key_bytes = np.asarray(state_key, dtype=np.int16).tobytes()
+        q_values = q_table.get(key_bytes)
+
+    if q_values is None:
+        return int(np.random.randint(0, action_space_n))
+
+    q_arr = np.asarray(q_values, dtype=np.float32)
+    usable = q_arr[:action_space_n]
+    if usable.size == 0:
+        return int(np.random.randint(0, action_space_n))
+    return int(np.argmax(usable))
+
+
 def _epsilon_greedy_action(
-    q_table: Dict[Tuple[int, ...], np.ndarray],
+    q_table: Dict[Any, np.ndarray],
     state_key: Tuple[int, ...],
     action_space_n: int,
     epsilon: float,
@@ -62,7 +88,7 @@ def _epsilon_greedy_action(
 
     if state_key not in q_table:
         q_table[state_key] = np.zeros(action_space_n, dtype=np.float32)
-    return int(np.argmax(q_table[state_key]))
+    return _select_greedy_action(q_table=q_table, state_key=state_key, action_space_n=action_space_n)
 
 
 def train_q_learning(
@@ -94,10 +120,19 @@ def train_q_learning(
     all_collected_history: List[float] = []
     step_history: List[int] = []
 
+    current_level = map_number
+    level_episode_count = 0
+    level_success_window = deque(maxlen=max(1, cfg.curriculum_promotion_window))
+
     for episode in range(1, cfg.episodes + 1):
+        level_for_episode = map_number
         if cfg.curriculum:
-            current_level = min(cfg.curriculum_max_level, 1 + (episode - 1) // cfg.curriculum_step_episodes)
-            env.set_map(map_kind=map_kind, map_number=current_level)
+            if cfg.curriculum_adaptive:
+                level_for_episode = current_level
+            else:
+                level_for_episode = min(cfg.curriculum_max_level, 1 + (episode - 1) // cfg.curriculum_step_episodes)
+                current_level = level_for_episode
+            env.set_map(map_kind=map_kind, map_number=level_for_episode)
 
         obs = env.reset()
         state_key = _obs_key(env, obs)
@@ -137,20 +172,43 @@ def train_q_learning(
 
         epsilon = max(cfg.epsilon_min, epsilon * cfg.epsilon_decay)
 
+        episode_success = 1.0 if info.get("level_completed", False) else 0.0
+        episode_all_collected = 1.0 if info.get("all_collected", False) else 0.0
+
         reward_history.append(total_reward)
-        success_history.append(1.0 if info.get("level_completed", False) else 0.0)
-        all_collected_history.append(1.0 if info.get("all_collected", False) else 0.0)
+        success_history.append(episode_success)
+        all_collected_history.append(episode_all_collected)
         step_history.append(steps)
+
+        if cfg.curriculum and cfg.curriculum_adaptive:
+            level_episode_count += 1
+            level_success_window.append(episode_success)
+            if (
+                current_level < cfg.curriculum_max_level
+                and level_episode_count >= cfg.curriculum_step_episodes
+                and len(level_success_window) == level_success_window.maxlen
+            ):
+                rolling_success = float(np.mean(level_success_window))
+                if rolling_success >= cfg.curriculum_promotion_success:
+                    prev_level = current_level
+                    current_level += 1
+                    level_episode_count = 0
+                    level_success_window.clear()
+                    epsilon = max(epsilon, cfg.curriculum_level_up_epsilon)
+                    print(
+                        f"Curriculum promotion: level {prev_level} -> {current_level} | "
+                        f"rolling_success={rolling_success:.2%} | epsilon={epsilon:.3f}"
+                    )
 
         if episode % cfg.report_every == 0 or episode == 1:
             avg_reward = float(np.mean(reward_history[-cfg.report_every :]))
             avg_success = float(np.mean(success_history[-cfg.report_every :]))
             avg_all_collected = float(np.mean(all_collected_history[-cfg.report_every :]))
             avg_steps = float(np.mean(step_history[-cfg.report_every :]))
-            current_level = min(cfg.curriculum_max_level, 1 + (episode - 1) // cfg.curriculum_step_episodes) if cfg.curriculum else map_number
+            current_level_for_log = current_level if cfg.curriculum else map_number
             print(
                 f"Episode {episode:4d} | "
-                f"level={current_level:2d} | "
+                f"level={current_level_for_log:2d} | "
                 f"avg_reward={avg_reward:8.2f} | "
                 f"all_collected_rate={avg_all_collected:5.2%} | "
                 f"success_rate={avg_success:5.2%} | "
@@ -159,7 +217,15 @@ def train_q_learning(
             )
 
         if cfg.preview_every > 0 and episode % cfg.preview_every == 0:
-            _preview_policy(q_table=q_table, map_kind=map_kind, map_number=map_number, observation_mode=observation_mode, local_view_size=local_view_size, max_steps=cfg.max_steps)
+            preview_level = current_level if cfg.curriculum else map_number
+            _preview_policy(
+                q_table=q_table,
+                map_kind=map_kind,
+                map_number=preview_level,
+                observation_mode=observation_mode,
+                local_view_size=local_view_size,
+                max_steps=cfg.max_steps,
+            )
 
     cfg.model_path.parent.mkdir(parents=True, exist_ok=True)
     with cfg.model_path.open("wb") as f:
@@ -186,7 +252,7 @@ def play_trained_agent(
     local_view_size: int = 5,
     render: bool = True,
     max_steps: int = 500,
-    render_fps: float = 8.0,
+    render_fps: float = 4.0,
     hold_finish_seconds: float = 2.0,
     wait_for_close: bool = False,
 ) -> Tuple[float, bool, bool, int]:
@@ -211,11 +277,11 @@ def play_trained_agent(
 
     while not done and steps < max_steps:
         state_key = _obs_key(env, obs)
-        if state_key in q_table:
-            action = int(np.argmax(q_table[state_key]))
-        else:
-            q_table[state_key] = np.zeros(env.action_space_n, dtype=np.float32)
-            action = int(np.argmax(q_table[state_key]))
+        action = _select_greedy_action(
+            q_table=q_table,
+            state_key=state_key,
+            action_space_n=env.action_space_n,
+        )
 
         obs, reward, done, info = env.step(action)
         total_reward += reward
@@ -257,7 +323,7 @@ def play_trained_agent(
 
 
 def _preview_policy(
-    q_table: Dict[Tuple[int, ...], np.ndarray],
+    q_table: Dict[Any, np.ndarray],
     map_kind: str,
     map_number: int,
     observation_mode: str,
@@ -280,11 +346,11 @@ def _preview_policy(
 
     while not done and steps < max_steps:
         state_key = _obs_key(env, obs)
-        if state_key in q_table:
-            action = int(np.argmax(q_table[state_key]))
-        else:
-            q_table[state_key] = np.zeros(env.action_space_n, dtype=np.float32)
-            action = int(np.argmax(q_table[state_key]))
+        action = _select_greedy_action(
+            q_table=q_table,
+            state_key=state_key,
+            action_space_n=env.action_space_n,
+        )
         obs, reward, done, _ = env.step(action)
         total_reward += reward
         env.render()
@@ -350,7 +416,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episodes", type=int, default=3000, help="Number of training/evaluation episodes")
     parser.add_argument("--play-episodes", type=int, default=1, help="Number of autonomous play episodes in --play mode")
     parser.add_argument("--no-render", action="store_true", help="Disable rendering in --play mode")
-    parser.add_argument("--render-fps", type=float, default=8.0, help="Playback speed for --play mode (frames/sec)")
+    parser.add_argument("--render-fps", type=float, default=4.0, help="Playback speed for --play mode (frames/sec)")
     parser.add_argument("--hold-finish-seconds", type=float, default=2.0, help="How long to keep window visible after episode")
     parser.add_argument("--wait-close", action="store_true", help="Keep window open until manually closed")
     parser.add_argument("--max-steps", type=int, default=500, help="Max steps per episode")
@@ -380,10 +446,15 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning across levels")
     parser.add_argument("--no-curriculum", action="store_false", dest="curriculum", help="Disable curriculum learning")
     parser.add_argument("--curriculum-max-level", type=int, default=5, help="Highest level index used by curriculum")
-    parser.add_argument("--curriculum-step-episodes", type=int, default=1500, help="Episodes per curriculum level")
+    parser.add_argument("--curriculum-step-episodes", type=int, default=1500, help="Minimum episodes per level before possible promotion")
+    parser.add_argument("--curriculum-adaptive", action="store_true", dest="curriculum_adaptive", help="Promote levels only after sustained success")
+    parser.add_argument("--curriculum-static", action="store_false", dest="curriculum_adaptive", help="Use fixed episode-based level schedule")
+    parser.add_argument("--curriculum-promotion-window", type=int, default=100, help="Rolling episode window size for promotion checks")
+    parser.add_argument("--curriculum-promotion-success", type=float, default=0.9, help="Required rolling success rate to promote level")
+    parser.add_argument("--curriculum-level-up-epsilon", type=float, default=0.15, help="Minimum epsilon to reset to when promoting")
     parser.add_argument("--debug-env", action="store_true", help="Enable debug prints from environment step info")
     parser.add_argument("--debug-every", type=int, default=100, help="Print debug info every N steps when debug mode is on")
-    parser.set_defaults(curriculum=True)
+    parser.set_defaults(curriculum=True, curriculum_adaptive=True)
     return parser
 
 
@@ -435,6 +506,10 @@ def _main() -> None:
         curriculum=args.curriculum,
         curriculum_max_level=args.curriculum_max_level,
         curriculum_step_episodes=args.curriculum_step_episodes,
+        curriculum_adaptive=args.curriculum_adaptive,
+        curriculum_promotion_window=args.curriculum_promotion_window,
+        curriculum_promotion_success=args.curriculum_promotion_success,
+        curriculum_level_up_epsilon=args.curriculum_level_up_epsilon,
         debug_env=args.debug_env,
         debug_every=args.debug_every,
         model_path=model_path,
