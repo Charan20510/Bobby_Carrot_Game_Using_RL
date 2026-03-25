@@ -5,6 +5,7 @@ from __future__ import annotations
 import pickle
 import sys
 import argparse
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -33,20 +34,26 @@ class QLearningConfig:
     alpha: float = 0.15
     gamma: float = 0.99
     epsilon_start: float = 1.0
-    epsilon_min: float = 0.05
+    epsilon_min: float = 0.01
     epsilon_decay: float = 0.995
     max_steps: int = 500
     report_every: int = 50
+    preview_every: int = 0
+    curriculum: bool = True
+    curriculum_max_level: int = 5
+    curriculum_step_episodes: int = 1500
+    debug_env: bool = False
+    debug_every: int = 100
     model_path: Path = Path(__file__).resolve().parent / "q_table_bobby.pkl"
 
 
-def _obs_key(obs: np.ndarray) -> bytes:
-    return obs.tobytes()
+def _obs_key(env: BobbyCarrotEnv, obs: np.ndarray) -> Tuple[int, ...]:
+    return env.observation_to_key(obs)
 
 
 def _epsilon_greedy_action(
-    q_table: Dict[bytes, np.ndarray],
-    state_key: bytes,
+    q_table: Dict[Tuple[int, ...], np.ndarray],
+    state_key: Tuple[int, ...],
     action_space_n: int,
     epsilon: float,
 ) -> int:
@@ -64,7 +71,7 @@ def train_q_learning(
     observation_mode: str = "local",
     local_view_size: int = 5,
     config: QLearningConfig | None = None,
-) -> Dict[bytes, np.ndarray]:
+) -> Dict[Tuple[int, ...], np.ndarray]:
     cfg = config or QLearningConfig()
 
     env = BobbyCarrotEnv(
@@ -72,20 +79,28 @@ def train_q_learning(
         map_number=map_number,
         observation_mode=observation_mode,
         local_view_size=local_view_size,
+        include_inventory=True,
         headless=True,
         max_steps=cfg.max_steps,
+        debug=cfg.debug_env,
+        debug_every=cfg.debug_every,
     )
 
-    q_table: Dict[bytes, np.ndarray] = {}
+    q_table: Dict[Tuple[int, ...], np.ndarray] = {}
     epsilon = cfg.epsilon_start
 
     reward_history: List[float] = []
     success_history: List[float] = []
+    all_collected_history: List[float] = []
     step_history: List[int] = []
 
     for episode in range(1, cfg.episodes + 1):
+        if cfg.curriculum:
+            current_level = min(cfg.curriculum_max_level, 1 + (episode - 1) // cfg.curriculum_step_episodes)
+            env.set_map(map_kind=map_kind, map_number=current_level)
+
         obs = env.reset()
-        state_key = _obs_key(obs)
+        state_key = _obs_key(env, obs)
 
         done = False
         total_reward = 0.0
@@ -100,7 +115,7 @@ def train_q_learning(
             )
 
             next_obs, reward, done, info = env.step(action)
-            next_key = _obs_key(next_obs)
+            next_key = _obs_key(env, next_obs)
 
             if state_key not in q_table:
                 q_table[state_key] = np.zeros(env.action_space_n, dtype=np.float32)
@@ -124,19 +139,27 @@ def train_q_learning(
 
         reward_history.append(total_reward)
         success_history.append(1.0 if info.get("level_completed", False) else 0.0)
+        all_collected_history.append(1.0 if info.get("all_collected", False) else 0.0)
         step_history.append(steps)
 
         if episode % cfg.report_every == 0 or episode == 1:
             avg_reward = float(np.mean(reward_history[-cfg.report_every :]))
             avg_success = float(np.mean(success_history[-cfg.report_every :]))
+            avg_all_collected = float(np.mean(all_collected_history[-cfg.report_every :]))
             avg_steps = float(np.mean(step_history[-cfg.report_every :]))
+            current_level = min(cfg.curriculum_max_level, 1 + (episode - 1) // cfg.curriculum_step_episodes) if cfg.curriculum else map_number
             print(
                 f"Episode {episode:4d} | "
+                f"level={current_level:2d} | "
                 f"avg_reward={avg_reward:8.2f} | "
+                f"all_collected_rate={avg_all_collected:5.2%} | "
                 f"success_rate={avg_success:5.2%} | "
                 f"avg_steps={avg_steps:6.1f} | "
                 f"epsilon={epsilon:.3f}"
             )
+
+        if cfg.preview_every > 0 and episode % cfg.preview_every == 0:
+            _preview_policy(q_table=q_table, map_kind=map_kind, map_number=map_number, observation_mode=observation_mode, local_view_size=local_view_size, max_steps=cfg.max_steps)
 
     cfg.model_path.parent.mkdir(parents=True, exist_ok=True)
     with cfg.model_path.open("wb") as f:
@@ -148,7 +171,7 @@ def train_q_learning(
     return q_table
 
 
-def load_q_table(model_path: Path | None = None) -> Dict[bytes, np.ndarray]:
+def load_q_table(model_path: Path | None = None) -> Dict[Tuple[int, ...], np.ndarray]:
     path = model_path or (Path(__file__).resolve().parent / "q_table_bobby.pkl")
     with path.open("rb") as f:
         data = pickle.load(f)
@@ -163,7 +186,10 @@ def play_trained_agent(
     local_view_size: int = 5,
     render: bool = True,
     max_steps: int = 500,
-) -> Tuple[float, bool, int]:
+    render_fps: float = 8.0,
+    hold_finish_seconds: float = 2.0,
+    wait_for_close: bool = False,
+) -> Tuple[float, bool, bool, int]:
     q_table = load_q_table(model_path)
 
     env = BobbyCarrotEnv(
@@ -171,6 +197,7 @@ def play_trained_agent(
         map_number=map_number,
         observation_mode=observation_mode,
         local_view_size=local_view_size,
+        include_inventory=True,
         headless=not render,
         max_steps=max_steps,
     )
@@ -180,13 +207,15 @@ def play_trained_agent(
     total_reward = 0.0
     steps = 0
     success = False
+    all_collected = False
 
     while not done and steps < max_steps:
-        state_key = _obs_key(obs)
+        state_key = _obs_key(env, obs)
         if state_key in q_table:
             action = int(np.argmax(q_table[state_key]))
         else:
-            action = int(np.random.randint(0, env.action_space_n))
+            q_table[state_key] = np.zeros(env.action_space_n, dtype=np.float32)
+            action = int(np.argmax(q_table[state_key]))
 
         obs, reward, done, info = env.step(action)
         total_reward += reward
@@ -194,18 +223,75 @@ def play_trained_agent(
 
         if render:
             env.render()
+            if render_fps > 0:
+                time.sleep(1.0 / render_fps)
 
         if info.get("level_completed", False):
             success = True
+        if info.get("all_collected", False):
+            all_collected = True
+
+    if render:
+        # Keep final frame visible long enough to see result.
+        if wait_for_close and env._pygame is not None:
+            pygame = env._pygame
+            print("Window is open. Close it to continue...")
+            waiting = True
+            while waiting:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        waiting = False
+                time.sleep(0.02)
+        elif hold_finish_seconds > 0:
+            time.sleep(hold_finish_seconds)
 
     env.close()
 
     print(
         f"Play finished | total_reward={total_reward:.2f} | "
+        f"all_collected={all_collected} | "
         f"success={success} | steps={steps}"
     )
 
-    return total_reward, success, steps
+    return total_reward, success, all_collected, steps
+
+
+def _preview_policy(
+    q_table: Dict[Tuple[int, ...], np.ndarray],
+    map_kind: str,
+    map_number: int,
+    observation_mode: str,
+    local_view_size: int,
+    max_steps: int,
+) -> None:
+    env = BobbyCarrotEnv(
+        map_kind=map_kind,
+        map_number=map_number,
+        observation_mode=observation_mode,
+        local_view_size=local_view_size,
+        include_inventory=True,
+        headless=False,
+        max_steps=max_steps,
+    )
+    obs = env.reset()
+    done = False
+    steps = 0
+    total_reward = 0.0
+
+    while not done and steps < max_steps:
+        state_key = _obs_key(env, obs)
+        if state_key in q_table:
+            action = int(np.argmax(q_table[state_key]))
+        else:
+            q_table[state_key] = np.zeros(env.action_space_n, dtype=np.float32)
+            action = int(np.argmax(q_table[state_key]))
+        obs, reward, done, _ = env.step(action)
+        total_reward += reward
+        env.render()
+        steps += 1
+
+    env.close()
+    print(f"Preview run | reward={total_reward:.2f} | steps={steps}")
 
 
 def evaluate_q_table(
@@ -219,10 +305,11 @@ def evaluate_q_table(
 ) -> Dict[str, float]:
     rewards: List[float] = []
     successes: List[float] = []
+    all_collected_list: List[float] = []
     steps_list: List[int] = []
 
     for _ in range(episodes):
-        total_reward, success, steps = play_trained_agent(
+        total_reward, success, all_collected, steps = play_trained_agent(
             model_path=model_path,
             map_kind=map_kind,
             map_number=map_number,
@@ -233,12 +320,14 @@ def evaluate_q_table(
         )
         rewards.append(total_reward)
         successes.append(1.0 if success else 0.0)
+        all_collected_list.append(1.0 if all_collected else 0.0)
         steps_list.append(steps)
 
     metrics = {
         "episodes": float(episodes),
         "mean_reward": float(np.mean(rewards)),
         "std_reward": float(np.std(rewards)),
+        "all_collected_rate": float(np.mean(all_collected_list)),
         "success_rate": float(np.mean(successes)),
         "mean_steps": float(np.mean(steps_list)),
     }
@@ -247,6 +336,7 @@ def evaluate_q_table(
     print(f"episodes={episodes}")
     print(f"mean_reward={metrics['mean_reward']:.2f}")
     print(f"std_reward={metrics['std_reward']:.2f}")
+    print(f"all_collected_rate={metrics['all_collected_rate']:.2%}")
     print(f"success_rate={metrics['success_rate']:.2%}")
     print(f"mean_steps={metrics['mean_steps']:.2f}")
 
@@ -256,7 +346,13 @@ def evaluate_q_table(
 def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train or evaluate Bobby Carrot Q-learning agent")
     parser.add_argument("--eval", action="store_true", dest="eval_mode", help="Run evaluation instead of training")
+    parser.add_argument("--play", action="store_true", dest="play_mode", help="Play with trained policy (autonomous gameplay)")
     parser.add_argument("--episodes", type=int, default=3000, help="Number of training/evaluation episodes")
+    parser.add_argument("--play-episodes", type=int, default=1, help="Number of autonomous play episodes in --play mode")
+    parser.add_argument("--no-render", action="store_true", help="Disable rendering in --play mode")
+    parser.add_argument("--render-fps", type=float, default=8.0, help="Playback speed for --play mode (frames/sec)")
+    parser.add_argument("--hold-finish-seconds", type=float, default=2.0, help="How long to keep window visible after episode")
+    parser.add_argument("--wait-close", action="store_true", help="Keep window open until manually closed")
     parser.add_argument("--max-steps", type=int, default=500, help="Max steps per episode")
     parser.add_argument("--map-kind", type=str, default="normal", choices=["normal", "egg"], help="Map kind")
     parser.add_argument("--map-number", type=int, default=1, help="Map number")
@@ -264,10 +360,10 @@ def _build_cli_parser() -> argparse.ArgumentParser:
         "--observation-mode",
         type=str,
         default="local",
-        choices=["local", "full"],
+        choices=["compact", "local", "full"],
         help="Observation type",
     )
-    parser.add_argument("--local-view-size", type=int, default=5, help="Odd local window size")
+    parser.add_argument("--local-view-size", type=int, default=3, help="Odd local window size")
     parser.add_argument(
         "--model-path",
         type=str,
@@ -277,9 +373,17 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alpha", type=float, default=0.15, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
-    parser.add_argument("--epsilon-min", type=float, default=0.05, help="Minimum epsilon")
+    parser.add_argument("--epsilon-min", type=float, default=0.01, help="Minimum epsilon")
     parser.add_argument("--epsilon-decay", type=float, default=0.995, help="Epsilon decay")
     parser.add_argument("--report-every", type=int, default=50, help="Training log interval")
+    parser.add_argument("--preview-every", type=int, default=0, help="Render one preview episode every N training episodes")
+    parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning across levels")
+    parser.add_argument("--no-curriculum", action="store_false", dest="curriculum", help="Disable curriculum learning")
+    parser.add_argument("--curriculum-max-level", type=int, default=5, help="Highest level index used by curriculum")
+    parser.add_argument("--curriculum-step-episodes", type=int, default=1500, help="Episodes per curriculum level")
+    parser.add_argument("--debug-env", action="store_true", help="Enable debug prints from environment step info")
+    parser.add_argument("--debug-every", type=int, default=100, help="Print debug info every N steps when debug mode is on")
+    parser.set_defaults(curriculum=True)
     return parser
 
 
@@ -301,6 +405,23 @@ def _main() -> None:
         )
         return
 
+    if args.play_mode:
+        for i in range(1, args.play_episodes + 1):
+            print(f"Play episode {i}/{args.play_episodes}")
+            play_trained_agent(
+                model_path=model_path,
+                map_kind=args.map_kind,
+                map_number=args.map_number,
+                observation_mode=args.observation_mode,
+                local_view_size=args.local_view_size,
+                render=not args.no_render,
+                max_steps=args.max_steps,
+                render_fps=args.render_fps,
+                hold_finish_seconds=args.hold_finish_seconds,
+                wait_for_close=args.wait_close,
+            )
+        return
+
     cfg = QLearningConfig(
         episodes=args.episodes,
         alpha=args.alpha,
@@ -310,6 +431,12 @@ def _main() -> None:
         epsilon_decay=args.epsilon_decay,
         max_steps=args.max_steps,
         report_every=args.report_every,
+        preview_every=args.preview_every,
+        curriculum=args.curriculum,
+        curriculum_max_level=args.curriculum_max_level,
+        curriculum_step_episodes=args.curriculum_step_episodes,
+        debug_env=args.debug_env,
+        debug_every=args.debug_every,
         model_path=model_path,
     )
 
