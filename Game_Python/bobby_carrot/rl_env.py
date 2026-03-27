@@ -41,12 +41,13 @@ ACTION_TO_STATE = {
 
 @dataclass
 class RewardConfig:
-    carrot: float = 10.0
-    egg: float = 20.0
-    finish: float = 50.0
-    death: float = -50.0
-    step: float = -0.1
-    invalid_move: float = -0.5
+    carrot: float = 15.0
+    egg: float = 25.0
+    finish: float = 100.0
+    death: float = -100.0
+    step: float = -0.05
+    invalid_move: float = -1.0
+    distance_delta_scale: float = 0.5
     new_best_target_distance_scale: float = 0.4
     new_best_finish_distance_scale: float = 0.8
     post_collection_step_penalty: float = -0.25
@@ -130,6 +131,7 @@ class BobbyCarrotEnv:
         self.target_positions: set[Tuple[int, int]] = set()
         self.finish_positions: set[Tuple[int, int]] = set()
         self.cached_targets_tile: Optional[set[int]] = None
+        self.key_bucket_divisor = 2
 
         # Rendering is optional and lazily initialized.
         self._pygame = None
@@ -212,7 +214,9 @@ class BobbyCarrotEnv:
 
         moved = before_pos != after_pos
         if moved and dist_before is not None and dist_after is not None:
-            info["distance_delta"] = float(dist_before - dist_after)
+            distance_delta = float(dist_before - dist_after)
+            info["distance_delta"] = distance_delta
+            reward += self.reward_config.distance_delta_scale * distance_delta
 
         # Grant progress reward only when a genuinely new best distance is reached.
         if not now_all_collected:
@@ -538,7 +542,10 @@ class BobbyCarrotEnv:
         ]
 
     def observation_to_key(self, obs: np.ndarray) -> Tuple[int, ...]:
-        return tuple(int(x) for x in obs.tolist())
+        obs_arr = np.asarray(obs, dtype=np.int16)
+        if self.key_bucket_divisor > 1:
+            obs_arr = np.floor_divide(obs_arr, self.key_bucket_divisor)
+        return tuple(int(x) for x in obs_arr.tolist())
 
     def _cache_target_positions(self) -> None:
         assert self.map_info is not None
@@ -592,25 +599,19 @@ class BobbyCarrotEnv:
             return -1
         if tile < 18:
             return 0
-        if tile in {18, 20, 21, 23, 30, 39}:
-            return 1
         if tile == 19:
-            return 2
+            return 1
         if tile == 45:
-            return 3
+            return 2
         if tile == 44:
-            return 4
+            return 3
         if tile in {31, 46}:
-            return 5
+            return 4
         if tile in {32, 34, 36}:
-            return 6
+            return 5
         if tile in {33, 35, 37}:
-            return 7
-        if tile in {22, 38}:
-            return 8
-        if tile in {24, 25, 26, 27, 28, 29, 40, 41, 42, 43}:
-            return 9
-        return 10
+            return 6
+        return 7
 
     @staticmethod
     def _tile_color(tile: int) -> Tuple[int, int, int]:

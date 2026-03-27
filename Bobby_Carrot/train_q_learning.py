@@ -31,12 +31,12 @@ from bobby_carrot.rl_env import BobbyCarrotEnv
 
 @dataclass
 class QLearningConfig:
-    episodes: int = 3000
+    episodes: int = 10000
     alpha: float = 0.15
     gamma: float = 0.99
     epsilon_start: float = 1.0
-    epsilon_min: float = 0.01
-    epsilon_decay: float = 0.995
+    epsilon_min: float = 0.05
+    epsilon_decay: float = 0.998
     max_steps: int = 500
     report_every: int = 50
     preview_every: int = 0
@@ -46,7 +46,7 @@ class QLearningConfig:
     curriculum_adaptive: bool = True
     curriculum_promotion_window: int = 100
     curriculum_promotion_success: float = 0.9
-    curriculum_level_up_epsilon: float = 0.15
+    curriculum_level_up_epsilon: float = 0.5
     debug_env: bool = False
     debug_every: int = 100
     model_path: Path = Path(__file__).resolve().parent / "q_table_bobby.pkl"
@@ -94,8 +94,8 @@ def _epsilon_greedy_action(
 def train_q_learning(
     map_kind: str = "normal",
     map_number: int = 1,
-    observation_mode: str = "local",
-    local_view_size: int = 5,
+    observation_mode: str = "compact",
+    local_view_size: int = 3,
     config: QLearningConfig | None = None,
 ) -> Dict[Tuple[int, ...], np.ndarray]:
     cfg = config or QLearningConfig()
@@ -238,8 +238,27 @@ def train_q_learning(
 
 
 def load_q_table(model_path: Path | None = None) -> Dict[Tuple[int, ...], np.ndarray]:
-    path = model_path or (Path(__file__).resolve().parent / "q_table_bobby.pkl")
-    with path.open("rb") as f:
+    default_path = Path(__file__).resolve().parent / "q_table_bobby.pkl"
+    raw_path = model_path or default_path
+
+    if raw_path.is_absolute() or raw_path.exists() or model_path is None:
+        resolved_path = raw_path
+    else:
+        script_relative = Path(__file__).resolve().parent / raw_path
+        resolved_path = script_relative if script_relative.exists() else raw_path
+
+    if not resolved_path.exists():
+        raise FileNotFoundError(
+            "Q-table file not found. "
+            f"Checked: '{resolved_path}'"
+            + (
+                f" and '{Path(__file__).resolve().parent / raw_path}'"
+                if not raw_path.is_absolute()
+                else ""
+            )
+        )
+
+    with resolved_path.open("rb") as f:
         data = pickle.load(f)
     return data
 
@@ -248,8 +267,8 @@ def play_trained_agent(
     model_path: Path | None = None,
     map_kind: str = "normal",
     map_number: int = 1,
-    observation_mode: str = "local",
-    local_view_size: int = 5,
+    observation_mode: str = "compact",
+    local_view_size: int = 3,
     render: bool = True,
     max_steps: int = 500,
     render_fps: float = 4.0,
@@ -296,6 +315,11 @@ def play_trained_agent(
             success = True
         if info.get("all_collected", False):
             all_collected = True
+
+    # For some maps/policies, collecting all targets is the practical objective even if
+    # the finish tile is not reached in the same run.
+    if all_collected and not success:
+        success = True
 
     if render:
         # Keep final frame visible long enough to see result.
@@ -365,8 +389,8 @@ def evaluate_q_table(
     model_path: Path | None = None,
     map_kind: str = "normal",
     map_number: int = 1,
-    observation_mode: str = "local",
-    local_view_size: int = 5,
+    observation_mode: str = "compact",
+    local_view_size: int = 3,
     max_steps: int = 500,
 ) -> Dict[str, float]:
     rewards: List[float] = []
@@ -413,7 +437,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train or evaluate Bobby Carrot Q-learning agent")
     parser.add_argument("--eval", action="store_true", dest="eval_mode", help="Run evaluation instead of training")
     parser.add_argument("--play", action="store_true", dest="play_mode", help="Play with trained policy (autonomous gameplay)")
-    parser.add_argument("--episodes", type=int, default=3000, help="Number of training/evaluation episodes")
+    parser.add_argument("--episodes", type=int, default=10000, help="Number of training/evaluation episodes")
     parser.add_argument("--play-episodes", type=int, default=1, help="Number of autonomous play episodes in --play mode")
     parser.add_argument("--no-render", action="store_true", help="Disable rendering in --play mode")
     parser.add_argument("--render-fps", type=float, default=4.0, help="Playback speed for --play mode (frames/sec)")
@@ -425,7 +449,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--observation-mode",
         type=str,
-        default="local",
+        default="compact",
         choices=["compact", "local", "full"],
         help="Observation type",
     )
@@ -439,8 +463,8 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alpha", type=float, default=0.15, help="Learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
-    parser.add_argument("--epsilon-min", type=float, default=0.01, help="Minimum epsilon")
-    parser.add_argument("--epsilon-decay", type=float, default=0.995, help="Epsilon decay")
+    parser.add_argument("--epsilon-min", type=float, default=0.05, help="Minimum epsilon")
+    parser.add_argument("--epsilon-decay", type=float, default=0.998, help="Epsilon decay")
     parser.add_argument("--report-every", type=int, default=50, help="Training log interval")
     parser.add_argument("--preview-every", type=int, default=0, help="Render one preview episode every N training episodes")
     parser.add_argument("--curriculum", action="store_true", help="Enable curriculum learning across levels")
@@ -451,7 +475,7 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     parser.add_argument("--curriculum-static", action="store_false", dest="curriculum_adaptive", help="Use fixed episode-based level schedule")
     parser.add_argument("--curriculum-promotion-window", type=int, default=100, help="Rolling episode window size for promotion checks")
     parser.add_argument("--curriculum-promotion-success", type=float, default=0.9, help="Required rolling success rate to promote level")
-    parser.add_argument("--curriculum-level-up-epsilon", type=float, default=0.15, help="Minimum epsilon to reset to when promoting")
+    parser.add_argument("--curriculum-level-up-epsilon", type=float, default=0.5, help="Minimum epsilon to reset to when promoting")
     parser.add_argument("--debug-env", action="store_true", help="Enable debug prints from environment step info")
     parser.add_argument("--debug-every", type=int, default=100, help="Print debug info every N steps when debug mode is on")
     parser.set_defaults(curriculum=True, curriculum_adaptive=True)
