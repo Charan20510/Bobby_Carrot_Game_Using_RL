@@ -38,7 +38,7 @@ except Exception as exc:  # pragma: no cover
     ) from exc
 
 GRID_SIZE = 16
-GRID_CHANNELS = 9  # wall, carrot, egg, goal, hazard, key, door, empty, agent
+GRID_CHANNELS = 10  # wall, carrot, egg, goal, hazard, key, door, empty, agent, phase
 INV_FEATURES = 4
 
 
@@ -54,8 +54,13 @@ class DQNConfig:
     target_update_steps: int = 1000
     train_every_steps: int = 4
     epsilon_start: float = 1.0
-    epsilon_min: float = 0.05
-    epsilon_decay: float = 0.999
+    epsilon_min: float = 0.10
+    epsilon_decay: float = 0.9995
+    completion_bonus: float = 250.0
+    post_collection_step_penalty: float = -0.35
+    phase_distance_bonus_scale: float = 1.25
+    invalid_move_penalty: float = -0.25
+    terminal_transition_oversample: int = 8
     report_every: int = 50
     seed: int = 42
 
@@ -132,6 +137,7 @@ def _semantic_channels(env: BobbyCarrotEnv) -> Tuple[np.ndarray, np.ndarray]:
     assert env.bobby is not None
 
     grid = np.zeros((GRID_CHANNELS, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+    all_collected = env.bobby.is_finished(env.map_info)
 
     for y in range(GRID_SIZE):
         for x in range(GRID_SIZE):
@@ -143,7 +149,8 @@ def _semantic_channels(env: BobbyCarrotEnv) -> Tuple[np.ndarray, np.ndarray]:
             elif tile == 45:
                 c = 2  # egg
             elif tile == 44:
-                c = 3  # goal
+                # Goal is relevant only after all collectibles are gathered.
+                c = 3 if all_collected else 7
             elif tile in {31, 46}:
                 c = 4  # hazard/death
             elif tile in {32, 34, 36}:
@@ -157,6 +164,8 @@ def _semantic_channels(env: BobbyCarrotEnv) -> Tuple[np.ndarray, np.ndarray]:
     px, py = env.bobby.coord_src
     if 0 <= px < GRID_SIZE and 0 <= py < GRID_SIZE:
         grid[8, py, px] = 1.0
+    if all_collected:
+        grid[9, :, :] = 1.0
 
     remaining_carrots = env.map_info.carrot_total - env.bobby.carrot_count
     remaining_eggs = env.map_info.egg_total - env.bobby.egg_count
@@ -171,6 +180,27 @@ def _semantic_channels(env: BobbyCarrotEnv) -> Tuple[np.ndarray, np.ndarray]:
         dtype=np.float32,
     )
     return grid, inv
+
+
+def _shape_transition_reward(raw_reward: float, info: Dict[str, object], cfg: DQNConfig) -> float:
+    reward = float(raw_reward)
+    all_collected = bool(info.get("all_collected", False))
+    level_completed = bool(info.get("level_completed", False))
+    invalid_move = bool(info.get("invalid_move", False))
+    distance_delta = float(info.get("distance_delta", 0.0))
+
+    if invalid_move:
+        reward += cfg.invalid_move_penalty
+
+    if all_collected and not level_completed:
+        # Once collection is done, force policy toward finish and discourage wandering.
+        reward += cfg.post_collection_step_penalty
+        reward += cfg.phase_distance_bonus_scale * distance_delta
+
+    if level_completed:
+        reward += cfg.completion_bonus
+
+    return reward
 
 
 class DQNAgent:
@@ -314,15 +344,19 @@ def train_one_level(
             action = agent.select_action(state_grid, state_inv)
             _, reward, done, info = env.step(action)
             next_grid, next_inv = _semantic_channels(env)
+            shaped_reward = _shape_transition_reward(reward, info, cfg)
 
-            agent.replay.push(state_grid, state_inv, action, reward, next_grid, next_inv, done)
+            agent.replay.push(state_grid, state_inv, action, shaped_reward, next_grid, next_inv, done)
+            if bool(info.get("level_completed", False)) and cfg.terminal_transition_oversample > 0:
+                for _ in range(cfg.terminal_transition_oversample):
+                    agent.replay.push(state_grid, state_inv, action, shaped_reward, next_grid, next_inv, done)
             agent.total_steps += 1
             loss = agent.optimize_step()
             if loss is not None:
                 loss_window.append(loss)
 
             state_grid, state_inv = next_grid, next_inv
-            total_reward += reward
+            total_reward += shaped_reward
             steps += 1
 
         agent.decay_epsilon()
@@ -422,8 +456,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=2.5e-4, help="Adam learning rate")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
-    parser.add_argument("--epsilon-min", type=float, default=0.05, help="Final epsilon")
-    parser.add_argument("--epsilon-decay", type=float, default=0.999, help="Epsilon decay per episode")
+    parser.add_argument("--epsilon-min", type=float, default=0.10, help="Final epsilon")
+    parser.add_argument("--epsilon-decay", type=float, default=0.9995, help="Epsilon decay per episode")
+    parser.add_argument("--completion-bonus", type=float, default=250.0, help="Extra reward on level completion")
+    parser.add_argument("--post-collection-step-penalty", type=float, default=-0.35, help="Penalty per step after all targets are collected but level not finished")
+    parser.add_argument("--phase-distance-bonus-scale", type=float, default=1.25, help="Distance-delta bonus scale after all targets are collected")
+    parser.add_argument("--invalid-move-penalty", type=float, default=-0.25, help="Additional penalty for invalid moves")
+    parser.add_argument("--terminal-transition-oversample", type=int, default=8, help="How many extra times to store successful terminal transitions")
     parser.add_argument("--report-every", type=int, default=50, help="Logging interval")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument(
@@ -454,6 +493,11 @@ def _make_cfg(args: argparse.Namespace) -> DQNConfig:
         epsilon_start=args.epsilon_start,
         epsilon_min=args.epsilon_min,
         epsilon_decay=args.epsilon_decay,
+        completion_bonus=args.completion_bonus,
+        post_collection_step_penalty=args.post_collection_step_penalty,
+        phase_distance_bonus_scale=args.phase_distance_bonus_scale,
+        invalid_move_penalty=args.invalid_move_penalty,
+        terminal_transition_oversample=args.terminal_transition_oversample,
         report_every=args.report_every,
         seed=args.seed,
     )
