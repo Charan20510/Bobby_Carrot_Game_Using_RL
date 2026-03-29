@@ -399,10 +399,12 @@ class DQNAgent:
 
         q_pred = self.policy_net(sg_t, sv_t).gather(1, a_t).squeeze(1)
 
-        with torch.inference_mode():
+        # no_grad (not inference_mode) so target stays a normal tensor
+        # that autograd can use when computing loss.backward()
+        with torch.no_grad():
             best_a = self.policy_net(nsg_t, nsv_t).argmax(1, keepdim=True)
             q_next = self.target_net(nsg_t, nsv_t).gather(1, best_a).squeeze(1)
-            target = r_t + (1.0 - d_t) * self.cfg.gamma * q_next
+            target = (r_t + (1.0 - d_t) * self.cfg.gamma * q_next).detach()
 
         loss = self.loss_fn(q_pred, target)
         self.optimizer.zero_grad(set_to_none=True)
