@@ -1,53 +1,21 @@
-Q-LEARNING (TABULAR)
+1)  
 
-1) LEVEL 3
+Training Level 4
 
-TRAIN:
-python.exe .\train_q_learning.py --episodes 10000 --no-curriculum --map-kind normal --map-number 3 --observation-mode compact --local-view-size 3 --max-steps 700 --model-path .\q_table_level3.pkl --report-every 50
+python train_dqn.py \
+  --levels 4 \
+  --map-kind normal \
+  --episodes-per-level 4000 \
+  --max-steps 900 \
+  --epsilon-decay 0.997 \
+  --batch-size 256 \
+  --lr 3e-4 \
+  --report-every 100
 
-PLAY:
-python.exe .\train_q_learning.py --play --play-episodes 3 --map-kind normal --map-number 3 --observation-mode compact --local-view-size 3 --max-steps 700 --model-path .\q_table_level3.pkl
+Playing Level 4
 
-2) LEVEL 4
+python train_dqn.py --play --map-kind normal --map-number 4 \
+  --model-path dqn_checkpoints/dqn_level4_sequential_best.pt \
+  --no-render \
+  --play-episodes 20
 
-TRAIN:
-python.exe .\train_q_learning.py --episodes 12000 --no-curriculum --map-kind normal --map-number 4 --observation-mode compact --local-view-size 3 --max-steps 800 --model-path .\q_table_level4.pkl --report-every 50
-
-PLAY:
-python.exe .\train_q_learning.py --play --play-episodes 3 --map-kind normal --map-number 4 --observation-mode compact --local-view-size 3 --max-steps 800 --model-path .\q_table_level4.pkl
-
-3) LEVEL 5
-
-TRAIN:
-python.exe .\train_q_learning.py --episodes 15000 --no-curriculum --map-kind normal --map-number 5 --observation-mode compact --local-view-size 3 --max-steps 900 --model-path .\q_table_level5.pkl --report-every 50
-
-PLAY:
-python.exe .\train_q_learning.py --play --play-episodes 3 --map-kind normal --map-number 5 --observation-mode compact --local-view-size 3 --max-steps 900 --model-path .\q_table_level5.pkl
-
-
-DQN (PYTORCH CNN)
-
-Install dependency first:
-pip install torch
-
-1) TRAIN LEVELS 3, 4, 5 INDIVIDUALLY (SEPARATE MODELS)
-python.exe .\train_dqn.py --levels 3 4 5 --individual-levels --episodes-per-level 6000 --max-steps 900 --checkpoint-dir .\dqn_checkpoints --report-every 50
-
-Saved models:
-.\dqn_checkpoints\dqn_level3_individual.pt
-.\dqn_checkpoints\dqn_level4_individual.pt
-.\dqn_checkpoints\dqn_level5_individual.pt
-
-2) PLAY EACH DQN MODEL AUTONOMOUSLY
-
-PLAY LEVEL 3:
-python.exe .\train_dqn.py --play --map-kind normal --map-number 3 --model-path .\dqn_checkpoints\dqn_level3_individual.pt --play-episodes 3 --max-steps 900
-
-PLAY LEVEL 4:
-python.exe .\train_dqn.py --play --map-kind normal --map-number 4 --model-path .\dqn_checkpoints\dqn_level4_individual.pt --play-episodes 3 --max-steps 900
-
-PLAY LEVEL 5:
-python.exe .\train_dqn.py --play --map-kind normal --map-number 5 --model-path .\dqn_checkpoints\dqn_level5_individual.pt --play-episodes 3 --max-steps 900
-
-3) OPTIONAL: SEQUENTIAL TRAINING ACROSS 3->4->5 (ONE MODEL, NO RESET)
-python.exe .\train_dqn.py --levels 3 4 5 --episodes-per-level 6000 --max-steps 900 --checkpoint-dir .\dqn_checkpoints --model-path .\dqn_3_4_5_sequential.pt --report-every 50
