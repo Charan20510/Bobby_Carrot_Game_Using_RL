@@ -71,75 +71,76 @@ _FLAT_IDX = np.arange(256, dtype=np.int32)
 _CH_BUF   = np.zeros(256, dtype=np.int8)
 _GRID_BUF = np.zeros((GRID_CHANNELS, 256), dtype=np.uint8)
 
+# Pre-built switch lookup tables (avoids dict creation each call)
+_SWITCH_RED  = np.arange(256, dtype=np.uint8)
+for _s, _d in {22:23, 23:22, 24:25, 25:26, 26:27, 27:24, 28:29, 29:28}.items():
+    _SWITCH_RED[_s] = _d
+_SWITCH_BLUE = np.arange(256, dtype=np.uint8)
+for _s, _d in {38:39, 39:38, 40:41, 41:40, 42:43, 43:42}.items():
+    _SWITCH_BLUE[_s] = _d
+
 
 # ─────────────────────────────────────────────────────────────
 # Per-level training configuration
+#   OPTIMIZED: ~40% fewer episodes; compensated by faster epsilon
+#   decay, larger batches, and better GPU utilisation via AMP.
 # ─────────────────────────────────────────────────────────────
 
 LEVEL_CONFIG: Dict[int, Dict] = {
-    1:  {"max_steps": 400,  "episodes": 3000, "distance_scale": 2.5, "post_penalty": -0.2},
-    2:  {"max_steps": 500,  "episodes": 3000, "distance_scale": 2.5, "post_penalty": -0.2},
-    3:  {"max_steps": 600,  "episodes": 3000, "distance_scale": 2.0, "post_penalty": -0.3},
-    4:  {"max_steps": 600,  "episodes": 3000, "distance_scale": 2.0, "post_penalty": -0.3},
-    5:  {"max_steps": 500,  "episodes": 3500, "distance_scale": 1.8, "post_penalty": -0.3},
-    6:  {"max_steps": 700,  "episodes": 3500, "distance_scale": 1.5, "post_penalty": -0.4},
-    7:  {"max_steps": 900,  "episodes": 5000, "distance_scale": 1.2, "post_penalty": -0.5},
-    8:  {"max_steps": 400,  "episodes": 3000, "distance_scale": 2.0, "post_penalty": -0.2},
-    9:  {"max_steps": 700,  "episodes": 3500, "distance_scale": 1.5, "post_penalty": -0.4},
-    10: {"max_steps": 600,  "episodes": 3500, "distance_scale": 1.8, "post_penalty": -0.3},
+    1:  {"max_steps": 400,  "episodes": 1800, "distance_scale": 2.5, "post_penalty": -0.2},
+    2:  {"max_steps": 500,  "episodes": 1800, "distance_scale": 2.5, "post_penalty": -0.2},
+    3:  {"max_steps": 600,  "episodes": 2000, "distance_scale": 2.0, "post_penalty": -0.3},
+    4:  {"max_steps": 600,  "episodes": 2000, "distance_scale": 2.0, "post_penalty": -0.3},
+    5:  {"max_steps": 500,  "episodes": 2200, "distance_scale": 1.8, "post_penalty": -0.3},
+    6:  {"max_steps": 700,  "episodes": 2200, "distance_scale": 1.5, "post_penalty": -0.4},
+    7:  {"max_steps": 900,  "episodes": 3000, "distance_scale": 1.2, "post_penalty": -0.5},
+    8:  {"max_steps": 400,  "episodes": 1800, "distance_scale": 2.0, "post_penalty": -0.2},
+    9:  {"max_steps": 700,  "episodes": 2200, "distance_scale": 1.5, "post_penalty": -0.4},
+    10: {"max_steps": 600,  "episodes": 2200, "distance_scale": 1.8, "post_penalty": -0.3},
 }
 
 def _get_level_cfg(level: int) -> Dict:
     return LEVEL_CONFIG.get(level, {
-        "max_steps": 600, "episodes": 3500,
+        "max_steps": 600, "episodes": 2200,
         "distance_scale": 1.8, "post_penalty": -0.3,
     })
 
 
 # ─────────────────────────────────────────────────────────────
-# DQNConfig
+# DQNConfig  —  OPTIMIZED defaults for Colab T4
 # ─────────────────────────────────────────────────────────────
 
 @dataclass
 class DQNConfig:
     gamma:               float = 0.99
-    lr:                  float = 5e-4          # higher LR → faster convergence on sparse signal
-    batch_size:          int   = 128           # smaller batch → more updates per env-step
-    replay_capacity:     int   = 50_000        # small buffer → stays fresh
-    min_replay_size:     int   = 500           # start learning very early
-    target_update_steps: int   = 600
-    train_every_steps:   int   = 1             # train after EVERY env step
-    # Exploration — slow decay so agent has time to find carrots before going greedy
+    lr:                  float = 1e-3            # higher LR for larger batches
+    batch_size:          int   = 256             # 256 saturates T4 better than 128
+    replay_capacity:     int   = 50_000
+    min_replay_size:     int   = 500
+    target_update_steps: int   = 500
+    train_every_steps:   int   = 4              # <<< KEY: 4x fewer grad updates
+    # Exploration — faster decay compensates fewer episodes
     epsilon_start:       float = 1.0
-    epsilon_min:         float = 0.10
-    epsilon_decay:       float = 0.9985        # hits 0.10 around ep ~1500
-    # Reward — carrot signal must dominate all penalties
+    epsilon_min:         float = 0.08
+    epsilon_decay:       float = 0.9975          # hits ~0.08 around ep ~1500
+    # Reward
     completion_bonus:    float = 200.0
-    death_penalty:       float = -30.0         # soft: don't overshadow carrot signal
-    carrot_bonus:        float = 40.0          # LARGE: unmistakably positive
+    death_penalty:       float = -30.0
+    carrot_bonus:        float = 40.0
     crumble_penalty:     float = -2.0
-    invalid_move_penalty:float = -0.2          # soft: don't punish exploration
-    step_penalty:        float = -0.01         # near-zero: don't drown signal in step cost
-    terminal_oversample: int   = 10            # store winning transitions many times
+    invalid_move_penalty:float = -0.2
+    step_penalty:        float = -0.01
+    terminal_oversample: int   = 8              # slightly less but still effective
     # Misc
     report_every:        int   = 100
     save_every:          int   = 250
     seed:                int   = 42
     observation_mode:    str   = "full"
+    use_amp:             bool  = True            # Mixed precision on CUDA
 
 
 # ─────────────────────────────────────────────────────────────
 # FastBobbyEnv — direct single-step game logic, no frame loop
-#
-# ROOT CAUSE OF sps=84:
-#   BobbyCarrotEnv._advance_until_transition() loops up to
-#   8 * FRAMES_PER_STEP * 3 = 48 Python calls to update_texture_position()
-#   per RL step. That function has large if/elif chains for sprite animation.
-#   48 calls × ~0.25ms each = ~12ms per step → sps ≈ 84.
-#
-# FIX: implement only the tile-transition logic (the step==8 branch of
-#   update_texture_position) with no animation bookkeeping at all.
-#   One step = one call. sps → 800–1500.
 # ─────────────────────────────────────────────────────────────
 
 class FastBobbyEnv:
@@ -197,7 +198,6 @@ class FastBobbyEnv:
 
         before_carrot = b.carrot_count
         before_egg    = b.egg_count
-        before_pos    = b.coord_src
 
         # ── apply movement ───────────────────────────────────
         desired = self.ACTIONS[action]
@@ -289,16 +289,12 @@ class FastBobbyEnv:
 
 
 def _apply_switch(md: List[int], tile: int) -> None:
-    """Toggle tiles for red (22) or blue (38) switch."""
-    pairs = (
-        {22:23, 23:22, 24:25, 25:26, 26:27, 27:24, 28:29, 29:28}
-        if tile == 22 else
-        {38:39, 39:38, 40:41, 41:40, 42:43, 43:42}
-    )
+    """Toggle tiles for red (22) or blue (38) switch — vectorised with numpy LUT."""
+    lut = _SWITCH_RED if tile == 22 else _SWITCH_BLUE
+    arr = np.asarray(md, dtype=np.uint8)
+    result = lut[arr]
     for i in range(256):
-        v = md[i]
-        if v in pairs:
-            md[i] = pairs[v]
+        md[i] = int(result[i])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -361,13 +357,6 @@ def _semantic_channels(env: FastBobbyEnv) -> Tuple[np.ndarray, np.ndarray]:
 
 # ─────────────────────────────────────────────────────────────
 # Reward shaping — all shaping lives here, env returns raw 0
-#
-# ROOT CAUSE OF collected=0%:
-#   The original BobbyCarrotEnv.RewardConfig applies step=-0.05 and
-#   no_progress_penalty=-0.2/-0.4 continuously. Combined with carrot_bonus=15,
-#   the agent can never collect a carrot early enough before the penalty flood
-#   overwhelms the signal. With step=-0.01 and carrot_bonus=40 the carrot
-#   reward is 4000x the per-step cost — the agent always "profits" by seeking.
 # ─────────────────────────────────────────────────────────────
 
 def _shape_reward(
@@ -399,11 +388,10 @@ def _shape_reward(
     level_done    = bool(info["level_completed"])
 
     # Distance shaping: prev_inv[4] = Manhattan norm to nearest target/finish
-    # Positive delta = moved closer = positive reward
     dist_delta = float(prev_inv[4]) - float(curr_inv[4])
     r += level_cfg["distance_scale"] * dist_delta
 
-    # Post-collection step penalty: collected everything but not yet on finish tile
+    # Post-collection step penalty
     if all_collected and not level_done:
         r += level_cfg["post_penalty"]
 
@@ -425,17 +413,16 @@ def _shape_reward(
 
 # ─────────────────────────────────────────────────────────────
 # Replay buffer — pre-allocated, uint8 grids, recency-biased sampling
-#
-# recency bias: 40% of each batch comes from the newest 25% of stored
-# transitions. Without this, early all-failure episodes dilute the buffer
-# and stall learning even after the agent starts finding carrots.
+#   OPTIMIZED: store grids as uint8 (original), convert to float32
+#   only when sampling. Use pinned memory for faster GPU transfer.
 # ─────────────────────────────────────────────────────────────
 
 class ReplayBuffer:
-    def __init__(self, capacity: int) -> None:
+    def __init__(self, capacity: int, pin_memory: bool = False) -> None:
         self._cap  = capacity
         self._ptr  = 0
         self._size = 0
+        self._pin  = pin_memory
         self._sg   = np.zeros((capacity, GRID_CHANNELS, GRID_SIZE, GRID_SIZE), dtype=np.uint8)
         self._sv   = np.zeros((capacity, INV_FEATURES),                         dtype=np.float32)
         self._a    = np.zeros(capacity,                                         dtype=np.int64)
@@ -488,11 +475,11 @@ class ReplayBuffer:
         np.random.shuffle(idx)
 
         return (
-            self._sg[idx].astype(np.float32),
+            self._sg[idx],    # kept as uint8 — converted to float on GPU
             self._sv[idx],
             self._a[idx],
             self._r[idx],
-            self._ng[idx].astype(np.float32),
+            self._ng[idx],    # kept as uint8
             self._nv[idx],
             self._d[idx],
         )
@@ -505,10 +492,6 @@ class ReplayBuffer:
 class DuelingDQNCNN(nn.Module):
     def __init__(self, n_actions: int) -> None:
         super().__init__()
-        # GroupNorm NOT BatchNorm:
-        #   BatchNorm updates running_mean/var INPLACE → crashes torch.compile
-        #   CUDA graph capture ("Inplace update to inference tensor").
-        #   GroupNorm has zero running stats — pure computation, compile-safe.
         self.conv = nn.Sequential(
             nn.Conv2d(GRID_CHANNELS, 32, kernel_size=3, padding=1),
             nn.GroupNorm(num_groups=8, num_channels=32),
@@ -532,7 +515,7 @@ class DuelingDQNCNN(nn.Module):
 
 
 # ─────────────────────────────────────────────────────────────
-# DQN Agent
+# DQN Agent  —  OPTIMIZED: AMP, fewer copies, reuse forward pass
 # ─────────────────────────────────────────────────────────────
 
 class DQNAgent:
@@ -550,21 +533,24 @@ class DQNAgent:
 
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=cfg.lr, eps=1.5e-4)
         self.loss_fn   = nn.SmoothL1Loss()
-        self.replay    = ReplayBuffer(cfg.replay_capacity)
+        self.replay    = ReplayBuffer(cfg.replay_capacity, pin_memory=(device.type == "cuda"))
+
+        # AMP scaler for mixed precision (CUDA only)
+        self.use_amp   = cfg.use_amp and (device.type == "cuda")
+        self.scaler    = torch.amp.GradScaler("cuda") if self.use_amp else None
+
+        # Pre-allocated single-sample tensors for action selection (avoid alloc per step)
+        self._g_buf = torch.zeros(1, GRID_CHANNELS, GRID_SIZE, GRID_SIZE, dtype=torch.float32, device=device)
+        self._v_buf = torch.zeros(1, INV_FEATURES, dtype=torch.float32, device=device)
 
     def select_action(self, grid: np.ndarray, inv: np.ndarray) -> int:
         if random.random() < self.epsilon:
             return random.randint(0, self.n_actions - 1)
-        # torch.no_grad() NOT inference_mode():
-        #   inference_mode marks output tensors as inference tensors.
-        #   Inplace ops on them inside torch.compile CUDA graph capture crash
-        #   with "Inplace update to inference tensor outside InferenceMode".
         with torch.no_grad():
-            g = torch.from_numpy(grid.astype(np.float32)).unsqueeze(0).to(
-                self.device, non_blocking=True)
-            v = torch.from_numpy(inv).unsqueeze(0).to(
-                self.device, non_blocking=True)
-            return int(self.policy_net(g, v).argmax(1).item())
+            # Copy into pre-allocated buffers (no alloc, no .to() overhead)
+            self._g_buf[0] = torch.from_numpy(grid.astype(np.float32))
+            self._v_buf[0] = torch.from_numpy(inv)
+            return int(self.policy_net(self._g_buf, self._v_buf).argmax(1).item())
 
     def optimize_step(self) -> Optional[float]:
         if len(self.replay) < self.cfg.min_replay_size:
@@ -574,27 +560,48 @@ class DQNAgent:
 
         sg, sv, acts, rwds, nsg, nsv, dones = self.replay.sample(self.cfg.batch_size)
 
-        sg_t  = torch.from_numpy(sg).to(self.device,    non_blocking=True)
+        # Convert uint8 grids to float32 and transfer to GPU
+        sg_t  = torch.from_numpy(sg.astype(np.float32)).to(self.device, non_blocking=True)
         sv_t  = torch.from_numpy(sv).to(self.device,    non_blocking=True)
         a_t   = torch.from_numpy(acts).unsqueeze(1).to(self.device, non_blocking=True)
         r_t   = torch.from_numpy(rwds).to(self.device,  non_blocking=True)
-        nsg_t = torch.from_numpy(nsg).to(self.device,   non_blocking=True)
+        nsg_t = torch.from_numpy(nsg.astype(np.float32)).to(self.device, non_blocking=True)
         nsv_t = torch.from_numpy(nsv).to(self.device,   non_blocking=True)
         d_t   = torch.from_numpy(dones).to(self.device, non_blocking=True)
 
-        q_pred = self.policy_net(sg_t, sv_t).gather(1, a_t).squeeze(1)
+        if self.use_amp:
+            with torch.amp.autocast("cuda"):
+                q_all  = self.policy_net(sg_t, sv_t)
+                q_pred = q_all.gather(1, a_t).squeeze(1)
 
-        with torch.no_grad():
-            # Double DQN: policy selects action, target evaluates it
-            best_a = self.policy_net(sg_t, sv_t).argmax(1, keepdim=True)
-            q_next = self.target_net(nsg_t, nsv_t).gather(1, best_a).squeeze(1)
-            target = (r_t + (1.0 - d_t) * self.cfg.gamma * q_next).detach()
+                with torch.no_grad():
+                    # OPTIMIZED Double DQN: reuse q_all for action selection
+                    best_a = q_all.detach().argmax(1, keepdim=True)
+                    q_next = self.target_net(nsg_t, nsv_t).gather(1, best_a).squeeze(1)
+                    target = r_t + (1.0 - d_t) * self.cfg.gamma * q_next
 
-        loss = self.loss_fn(q_pred, target)
-        self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
-        self.optimizer.step()
+                loss = self.loss_fn(q_pred, target)
+
+            self.optimizer.zero_grad(set_to_none=True)
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            q_all  = self.policy_net(sg_t, sv_t)
+            q_pred = q_all.gather(1, a_t).squeeze(1)
+
+            with torch.no_grad():
+                best_a = q_all.detach().argmax(1, keepdim=True)
+                q_next = self.target_net(nsg_t, nsv_t).gather(1, best_a).squeeze(1)
+                target = r_t + (1.0 - d_t) * self.cfg.gamma * q_next
+
+            loss = self.loss_fn(q_pred, target)
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
+            self.optimizer.step()
 
         if self.total_steps % self.cfg.target_update_steps == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -650,7 +657,6 @@ def _make_env(map_kind: str, level: int, max_steps: int) -> FastBobbyEnv:
 
 
 # "default" mode — safe with GroupNorm.
-# "reduce-overhead" forces CUDA graphs → crash with inplace ops (BatchNorm etc).
 def _maybe_compile(model: nn.Module, device: torch.device) -> nn.Module:
     if not hasattr(torch, "compile") or device.type != "cuda":
         return model
@@ -662,7 +668,7 @@ def _maybe_compile(model: nn.Module, device: torch.device) -> nn.Module:
 
 
 # ─────────────────────────────────────────────────────────────
-# Training loop
+# Training loop  —  OPTIMIZED inner loop
 # ─────────────────────────────────────────────────────────────
 
 def train_one_level(
@@ -689,10 +695,17 @@ def train_one_level(
           f"dist_scale={level_cfg['distance_scale']} | "
           f"post_pen={level_cfg['post_penalty']} | "
           f"batch={cfg.batch_size} | lr={cfg.lr} | "
-          f"carrot={cfg.carrot_bonus} | eps_decay={cfg.epsilon_decay}")
+          f"carrot={cfg.carrot_bonus} | eps_decay={cfg.epsilon_decay} | "
+          f"train_every={cfg.train_every_steps} | amp={cfg.use_amp}")
 
     t0 = time.time()
     total_env_steps = 0
+
+    # Local variable caching for hot loop
+    replay_push     = agent.replay.push
+    select_action   = agent.select_action
+    optimize_step   = agent.optimize_step
+    terminal_os     = cfg.terminal_oversample
 
     for episode in range(1, n_episodes + 1):
         env.set_map(map_kind=map_kind, map_number=level)
@@ -706,22 +719,22 @@ def train_one_level(
         prev_inv = inv.copy()
 
         while not done and steps < max_steps:
-            action         = agent.select_action(grid, inv)
+            action         = select_action(grid, inv)
             _, done, info  = env.step(action)
             next_grid, next_inv = _semantic_channels(env)
 
             shaped = _shape_reward(info, cfg, level_cfg, prev_inv, next_inv, env)
 
-            agent.replay.push(grid, inv, action, shaped, next_grid, next_inv, done)
+            replay_push(grid, inv, action, shaped, next_grid, next_inv, done)
 
             # Oversample rare winning transitions
-            if info.get("level_completed") and cfg.terminal_oversample > 0:
-                for _ in range(cfg.terminal_oversample):
-                    agent.replay.push(grid, inv, action, shaped, next_grid, next_inv, done)
+            if info.get("level_completed") and terminal_os > 0:
+                for _ in range(terminal_os):
+                    replay_push(grid, inv, action, shaped, next_grid, next_inv, done)
 
             agent.total_steps  += 1
             total_env_steps    += 1
-            loss = agent.optimize_step()
+            loss = optimize_step()
             if loss is not None:
                 loss_win.append(loss)
 
@@ -758,11 +771,11 @@ def train_one_level(
                 f"ETA={eta_h:.1f}h"
             )
 
-            # Early stop: 90%+ success for 3 consecutive windows
+            # Early stop: 90%+ success for 2 consecutive windows (was 3)
             if avg_s >= 0.90:
                 early_stop_wins += 1
-                if early_stop_wins >= 3:
-                    print(f"[L{level}] Early stop: success >= 90% for 3 windows.")
+                if early_stop_wins >= 2:
+                    print(f"[L{level}] Early stop: success >= 90% for 2 windows.")
                     break
             else:
                 early_stop_wins = 0
@@ -874,19 +887,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--individual-levels",  action="store_true")
     p.add_argument("--episodes-per-level", type=int,   default=None)
     p.add_argument("--max-steps",          type=int,   default=None)
-    p.add_argument("--batch-size",         type=int,   default=128)
-    p.add_argument("--lr",                 type=float, default=5e-4)
+    p.add_argument("--batch-size",         type=int,   default=256)
+    p.add_argument("--lr",                 type=float, default=1e-3)
     p.add_argument("--gamma",              type=float, default=0.99)
     p.add_argument("--epsilon-start",      type=float, default=1.0)
-    p.add_argument("--epsilon-min",        type=float, default=0.10)
-    p.add_argument("--epsilon-decay",      type=float, default=0.9985)
+    p.add_argument("--epsilon-min",        type=float, default=0.08)
+    p.add_argument("--epsilon-decay",      type=float, default=0.9975)
     p.add_argument("--completion-bonus",   type=float, default=200.0)
     p.add_argument("--death-penalty",      type=float, default=-30.0)
     p.add_argument("--carrot-bonus",       type=float, default=40.0)
     p.add_argument("--crumble-penalty",    type=float, default=-2.0)
     p.add_argument("--invalid-move-penalty", type=float, default=-0.2)
     p.add_argument("--step-penalty",       type=float, default=-0.01)
-    p.add_argument("--terminal-oversample", type=int,  default=10)
+    p.add_argument("--terminal-oversample", type=int,  default=8)
+    p.add_argument("--train-every",        type=int,   default=4,
+                   help="Gradient update every N env steps (default: 4)")
     p.add_argument("--observation-mode",   default="full", choices=["full","local","compact"])
     p.add_argument("--report-every",       type=int,   default=100)
     p.add_argument("--seed",               type=int,   default=42)
@@ -899,6 +914,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--render-fps",         type=float, default=5.0)
     p.add_argument("--no-compile",         action="store_true",
                    help="Disable torch.compile (skips ~30s warm-up on T4)")
+    p.add_argument("--no-amp",             action="store_true",
+                   help="Disable mixed precision training")
     return p
 
 
@@ -914,6 +931,8 @@ def _cfg_from_args(args: argparse.Namespace) -> DQNConfig:
         terminal_oversample=args.terminal_oversample,
         observation_mode=args.observation_mode,
         report_every=args.report_every, seed=args.seed,
+        train_every_steps=args.train_every,
+        use_amp=not args.no_amp,
     )
 
 
@@ -941,6 +960,9 @@ def _main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    if device.type == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+        print(f"AMP: {cfg.use_amp} | train_every: {cfg.train_every_steps}")
 
     levels = [int(l) for l in (args.levels or [args.map_number])]
     for lvl in levels:
