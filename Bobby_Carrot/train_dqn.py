@@ -90,7 +90,7 @@ LEVEL_CONFIG: Dict[int, Dict] = {
     1:  {"max_steps": 400,  "episodes": 1800, "distance_scale": 2.5, "post_penalty": -0.2},
     2:  {"max_steps": 500,  "episodes": 1800, "distance_scale": 2.5, "post_penalty": -0.2},
     3:  {"max_steps": 600,  "episodes": 2000, "distance_scale": 2.0, "post_penalty": -0.3},
-    4:  {"max_steps": 600,  "episodes": 2000, "distance_scale": 2.0, "post_penalty": -0.3},
+    4:  {"max_steps": 1000, "episodes": 3000, "distance_scale": 3.0, "post_penalty": -0.2},
     5:  {"max_steps": 500,  "episodes": 2200, "distance_scale": 1.8, "post_penalty": -0.3},
     6:  {"max_steps": 700,  "episodes": 2200, "distance_scale": 1.5, "post_penalty": -0.4},
     7:  {"max_steps": 900,  "episodes": 3000, "distance_scale": 1.2, "post_penalty": -0.5},
@@ -121,8 +121,8 @@ class DQNConfig:
     train_every_steps:   int   = 4              # <<< KEY: 4x fewer grad updates
     # Exploration — faster decay compensates fewer episodes
     epsilon_start:       float = 1.0
-    epsilon_min:         float = 0.08
-    epsilon_decay:       float = 0.9975          # hits ~0.08 around ep ~1500
+    epsilon_min:         float = 0.05
+    epsilon_decay:       float = 0.9980          # slower decay for complex levels
     # Reward
     completion_bonus:    float = 200.0
     death_penalty:       float = -30.0
@@ -130,6 +130,7 @@ class DQNConfig:
     crumble_penalty:     float = -2.0
     invalid_move_penalty:float = -0.2
     step_penalty:        float = -0.01
+    revisit_penalty:     float = -0.15           # penalise revisiting same cell
     terminal_oversample: int   = 8              # slightly less but still effective
     # Misc
     report_every:        int   = 100
@@ -366,6 +367,7 @@ def _shape_reward(
     prev_inv:   np.ndarray,
     curr_inv:   np.ndarray,
     env:        FastBobbyEnv,
+    visit_counts: Optional[np.ndarray] = None,
 ) -> float:
     r = cfg.step_penalty
 
@@ -407,6 +409,14 @@ def _shape_reward(
                     if md[nx + ny * GRID_SIZE] == 19:
                         r += cfg.crumble_penalty
                         break
+
+    # Anti-oscillation: penalise revisiting cells (visits > 2)
+    if visit_counts is not None and env.bobby is not None:
+        px, py = env.bobby.coord_src
+        pos_idx = px + py * GRID_SIZE
+        visits = int(visit_counts[pos_idx])
+        if visits > 2:
+            r += cfg.revisit_penalty * (visits - 2)
 
     return r
 
@@ -717,13 +727,23 @@ def train_one_level(
         ep_r     = 0.0
         info: Dict[str, object] = {}
         prev_inv = inv.copy()
+        # Track cell visits per episode to penalise oscillation
+        visit_counts = np.zeros(GRID_SIZE * GRID_SIZE, dtype=np.int16)
+        if env.bobby is not None:
+            sx, sy = env.bobby.coord_src
+            visit_counts[sx + sy * GRID_SIZE] = 1
 
         while not done and steps < max_steps:
             action         = select_action(grid, inv)
             _, done, info  = env.step(action)
             next_grid, next_inv = _semantic_channels(env)
 
-            shaped = _shape_reward(info, cfg, level_cfg, prev_inv, next_inv, env)
+            # Update visit count for current position
+            if env.bobby is not None:
+                px, py = env.bobby.coord_src
+                visit_counts[px + py * GRID_SIZE] += 1
+
+            shaped = _shape_reward(info, cfg, level_cfg, prev_inv, next_inv, env, visit_counts)
 
             replay_push(grid, inv, action, shaped, next_grid, next_inv, done)
 
