@@ -183,11 +183,16 @@ class ReplayBuffer:
 class DuelingDQNCNN(nn.Module):
     def __init__(self, n_actions: int) -> None:
         super().__init__()
+        # GroupNorm instead of BatchNorm2d:
+        #   - BatchNorm does inplace updates to running_mean/var buffers which are
+        #     inference tensors → crashes torch.compile CUDA graph capture
+        #   - GroupNorm has NO running stats — pure computation, compile-safe
+        #   - num_groups=8 works well for 32 channels (4 channels per group)
         self.conv = nn.Sequential(
             nn.Conv2d(GRID_CHANNELS, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),   # FIX: stabilises training on harder levels
+            nn.GroupNorm(num_groups=8, num_channels=32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 48, kernel_size=3, padding=1),   # FIX: 64→48, faster
+            nn.Conv2d(32, 48, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(48, 48, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -376,29 +381,20 @@ class DQNAgent:
         is_cuda = (device.type == "cuda")
         self.replay = ReplayBuffer(cfg.replay_capacity, pin=is_cuda)
 
-        # Pinned inference buffers — avoids per-step host allocation
-        self._inf_grid = torch.zeros(
-            (1, GRID_CHANNELS, GRID_SIZE, GRID_SIZE),
-            dtype=torch.float32
-        ).pin_memory() if is_cuda else torch.zeros(
-            (1, GRID_CHANNELS, GRID_SIZE, GRID_SIZE), dtype=torch.float32
-        )
-        self._inf_inv = torch.zeros(
-            (1, INV_FEATURES), dtype=torch.float32
-        ).pin_memory() if is_cuda else torch.zeros(
-            (1, INV_FEATURES), dtype=torch.float32
-        )
-
-    @torch.inference_mode()
     def select_action(self, grid: np.ndarray, inv: np.ndarray) -> int:
         if random.random() < self.epsilon:
             return random.randint(0, self.n_actions - 1)
-        # FIX: use torch.from_numpy + copy_ (zero-copy path when possible)
-        self._inf_grid[0].copy_(torch.from_numpy(grid.astype(np.float32)))
-        self._inf_inv[0].copy_(torch.from_numpy(inv))
-        g = self._inf_grid.to(self.device, non_blocking=True)
-        v = self._inf_inv.to(self.device,  non_blocking=True)
-        return int(self.policy_net(g, v).argmax(1).item())
+        # Use no_grad (NOT inference_mode): inference_mode marks output tensors
+        # as inference tensors — inplace ops on them inside torch.compile CUDA
+        # graph capture raise "Inplace update to inference tensor" RuntimeError.
+        with torch.no_grad():
+            g = torch.from_numpy(grid.astype(np.float32)).unsqueeze(0).to(
+                self.device, non_blocking=True
+            )
+            v = torch.from_numpy(inv).unsqueeze(0).to(
+                self.device, non_blocking=True
+            )
+            return int(self.policy_net(g, v).argmax(1).item())
 
     def optimize_step(self) -> Optional[float]:
         if len(self.replay) < self.cfg.min_replay_size:
@@ -416,13 +412,9 @@ class DQNAgent:
         nsv_t = torch.from_numpy(nsv).to(self.device,   non_blocking=True)
         d_t   = torch.from_numpy(dones).to(self.device, non_blocking=True)
 
-        # FIX: policy_net must be in train() mode for BatchNorm to work correctly
-        self.policy_net.train()
         q_pred = self.policy_net(sg_t, sv_t).gather(1, a_t).squeeze(1)
 
         with torch.no_grad():
-            # FIX: target_net in eval() mode — BatchNorm uses running stats
-            self.target_net.eval()
             best_a = self.policy_net(sg_t, sv_t).argmax(1, keepdim=True)   # double DQN
             q_next = self.target_net(nsg_t, nsv_t).gather(1, best_a).squeeze(1)
             target = (r_t + (1.0 - d_t) * self.cfg.gamma * q_next).detach()
@@ -510,7 +502,10 @@ def _maybe_compile(model: nn.Module, device: torch.device) -> nn.Module:
     if device.type != "cuda":
         return model   # torch.compile on CPU is often slower
     try:
-        return torch.compile(model, mode="reduce-overhead")
+        # "default" mode: applies kernel fusion & vectorisation without CUDA
+        # graph capture. "reduce-overhead" forces CUDA graphs which crash when
+        # any layer does inplace updates (GroupNorm, running stats, etc.).
+        return torch.compile(model, mode="default")
     except Exception as e:
         print(f"[warn] torch.compile failed: {e} — running without compilation.")
         return model
