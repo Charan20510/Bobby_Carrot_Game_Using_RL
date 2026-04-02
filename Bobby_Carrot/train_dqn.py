@@ -8,6 +8,7 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -90,7 +91,7 @@ LEVEL_CONFIG: Dict[int, Dict] = {
     1:  {"max_steps": 400,  "episodes": 1800, "distance_scale": 2.5, "post_penalty": -0.2},
     2:  {"max_steps": 500,  "episodes": 1800, "distance_scale": 2.5, "post_penalty": -0.2},
     3:  {"max_steps": 600,  "episodes": 2000, "distance_scale": 2.0, "post_penalty": -0.3},
-    4:  {"max_steps": 1000, "episodes": 3000, "distance_scale": 3.0, "post_penalty": -0.2},
+    4:  {"max_steps": 1500, "episodes": 3000, "distance_scale": 3.0, "post_penalty": -0.2},
     5:  {"max_steps": 500,  "episodes": 2200, "distance_scale": 1.8, "post_penalty": -0.3},
     6:  {"max_steps": 700,  "episodes": 2200, "distance_scale": 1.5, "post_penalty": -0.4},
     7:  {"max_steps": 900,  "episodes": 3000, "distance_scale": 1.2, "post_penalty": -0.5},
@@ -104,6 +105,34 @@ def _get_level_cfg(level: int) -> Dict:
         "max_steps": 600, "episodes": 2200,
         "distance_scale": 1.8, "post_penalty": -0.3,
     })
+
+
+@lru_cache(maxsize=128)
+def _get_level_map_stats(map_kind: str, level: int) -> Dict[str, int]:
+    """Return tile counts needed for map-aware training budgets."""
+    mi = Map(map_kind, level).load_map_info()
+    arr = np.asarray(mi.data, dtype=np.uint8)
+    return {
+        "carrots": int(np.count_nonzero(arr == 19)),
+        "eggs": int(np.count_nonzero(arr == 45)),
+        "crumbles": int(np.count_nonzero(arr == 30)),
+        "conveyors": int(np.count_nonzero((arr >= 40) & (arr <= 43))),
+    }
+
+
+def _map_aware_budget(level: int, map_kind: str, base_cfg: Dict) -> Tuple[int, int]:
+    """Cap training cost using level structure; keeps difficult maps learnable but tractable."""
+    stats = _get_level_map_stats(map_kind, level)
+    collectibles = stats["carrots"] + stats["eggs"]
+    complexity = collectibles + stats["crumbles"] + (2 * stats["conveyors"])
+
+    max_steps_cap = 120 + (16 * collectibles) + (8 * stats["crumbles"]) + (20 * stats["conveyors"])
+    max_steps = min(int(base_cfg["max_steps"]), max(220, max_steps_cap))
+
+    episodes_cap = 700 + (20 * collectibles) + (8 * stats["crumbles"]) + (15 * stats["conveyors"])
+    episodes = min(int(base_cfg["episodes"]), max(900, episodes_cap if complexity >= 20 else 900))
+
+    return max_steps, episodes
 
 
 # ─────────────────────────────────────────────────────────────
@@ -130,7 +159,7 @@ class DQNConfig:
     crumble_penalty:     float = -2.0
     invalid_move_penalty:float = -0.2
     step_penalty:        float = -0.01
-    revisit_penalty:     float = -0.15           # penalise revisiting same cell
+    revisit_penalty:     float = -0.05           # mild penalty for revisiting cells
     terminal_oversample: int   = 8              # slightly less but still effective
     # Misc
     report_every:        int   = 100
@@ -221,7 +250,7 @@ class FastBobbyEnv:
             elif ot == 27: md[old_pos] = 24
             elif ot == 28: md[old_pos] = 29
             elif ot == 29: md[old_pos] = 28
-            elif ot == 30: md[old_pos] = 31          # crumble → broken
+            elif ot == 30: md[old_pos] = 0            # crumble → wall (not spike)
             elif ot == 45:                           # egg step-on
                 md[old_pos] = 46
                 b.egg_count += 1
@@ -585,8 +614,9 @@ class DQNAgent:
                 q_pred = q_all.gather(1, a_t).squeeze(1)
 
                 with torch.no_grad():
-                    # OPTIMIZED Double DQN: reuse q_all for action selection
-                    best_a = q_all.detach().argmax(1, keepdim=True)
+                    # Double DQN: choose next actions from policy(next_state).
+                    next_q_policy = self.policy_net(nsg_t, nsv_t)
+                    best_a = next_q_policy.argmax(1, keepdim=True)
                     q_next = self.target_net(nsg_t, nsv_t).gather(1, best_a).squeeze(1)
                     target = r_t + (1.0 - d_t) * self.cfg.gamma * q_next
 
@@ -603,7 +633,8 @@ class DQNAgent:
             q_pred = q_all.gather(1, a_t).squeeze(1)
 
             with torch.no_grad():
-                best_a = q_all.detach().argmax(1, keepdim=True)
+                next_q_policy = self.policy_net(nsg_t, nsv_t)
+                best_a = next_q_policy.argmax(1, keepdim=True)
                 q_next = self.target_net(nsg_t, nsv_t).gather(1, best_a).squeeze(1)
                 target = r_t + (1.0 - d_t) * self.cfg.gamma * q_next
 
@@ -660,6 +691,9 @@ def _seed_everything(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
 
 def _make_env(map_kind: str, level: int, max_steps: int) -> FastBobbyEnv:
@@ -689,9 +723,9 @@ def train_one_level(
     ckpt_path: Optional[Path] = None,
 ) -> Dict[str, float]:
 
-    level_cfg  = _get_level_cfg(level)
-    max_steps  = level_cfg["max_steps"]
-    n_episodes = level_cfg["episodes"]
+    level_cfg = _get_level_cfg(level)
+    max_steps, n_episodes = _map_aware_budget(level, map_kind, level_cfg)
+    stats = _get_level_map_stats(map_kind, level)
     env        = _make_env(map_kind, level, max_steps)
 
     reward_hist:    List[float] = []
@@ -704,6 +738,8 @@ def train_one_level(
     print(f"  max_steps={max_steps} | episodes={n_episodes} | "
           f"dist_scale={level_cfg['distance_scale']} | "
           f"post_pen={level_cfg['post_penalty']} | "
+            f"collectibles={stats['carrots'] + stats['eggs']} | "
+            f"crumbles={stats['crumbles']} | conveyors={stats['conveyors']} | "
           f"batch={cfg.batch_size} | lr={cfg.lr} | "
           f"carrot={cfg.carrot_bonus} | eps_decay={cfg.epsilon_decay} | "
           f"train_every={cfg.train_every_steps} | amp={cfg.use_amp}")
@@ -832,7 +868,7 @@ def play_trained_dqn(
     if cfg is None:
         cfg = DQNConfig()
     level_cfg = _get_level_cfg(map_number)
-    max_steps = level_cfg["max_steps"]
+    max_steps, _ = _map_aware_budget(map_number, map_kind, level_cfg)
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Silence all env-internal reward so we measure true task performance
