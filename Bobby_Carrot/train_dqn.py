@@ -84,7 +84,7 @@ _SWITCH_BLUE_NP = _SWITCH_BLUE.copy()
 # ─────────────────────────────────────────────────────────────
 
 def _bfs_reachable_carrot_info(md, sx, sy, grid_size=GRID_SIZE):
-    """BFS from (sx,sy). Return (reachable_carrot_count, nearest_bfs_dist, finish_reachable).
+    """BFS from (sx,sy). Return (reachable_carrot_count, nearest_bfs_dist, finish_reachable, finish_dist).
 
     Walkable tiles: tile >= 18 and tile not in {31, 46}.
     Spike (31) and broken-egg spike (46) are impassable.
@@ -100,6 +100,7 @@ def _bfs_reachable_carrot_info(md, sx, sy, grid_size=GRID_SIZE):
     reachable_count = 0
     nearest_dist = -1
     finish_reachable = False
+    finish_dist = -1
 
     while q:
         x, y, dist = q.popleft()
@@ -111,6 +112,8 @@ def _bfs_reachable_carrot_info(md, sx, sy, grid_size=GRID_SIZE):
                 nearest_dist = dist
         elif tile == 44:
             finish_reachable = True
+            if finish_dist < 0 or dist < finish_dist:
+                finish_dist = dist
 
         for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             nx, ny = x + dx, y + dy
@@ -122,7 +125,7 @@ def _bfs_reachable_carrot_info(md, sx, sy, grid_size=GRID_SIZE):
                         visited[ni] = 1
                         q.append((nx, ny, dist + 1))
 
-    return reachable_count, nearest_dist, finish_reachable
+    return reachable_count, nearest_dist, finish_reachable, finish_dist
 
 
 # ─────────────────────────────────────────────────────────────
@@ -367,29 +370,22 @@ class FastBobbyEnv:
         # Evaluate reachability loss if a crumble was destroyed
         destroyed_crumble = moved and ot == 30
         carrots_lost = 0
-        if destroyed_crumble and not all_collected:
-            # We just left a crumble, converting it to a spike (31)
-            # Recheck reachability
-            px, py = b.coord_src
-            reachable_count, _, finish_reachable = _bfs_reachable_carrot_info(md, px, py)
-            remaining = (self._expected_carrots - b.carrot_count) + (self._expected_eggs - b.egg_count)
-            if reachable_count < remaining:
-                carrots_lost = remaining - reachable_count
-                
         finish_lost = False
-        if moved and not all_collected:
-            # We don't just check crumble, if anything makes finish unreachable we might want to know,
-            # but usually it's crumble. Let's just check finish reachability after crumble destruction.
-            if destroyed_crumble:
-                if "finish_reachable" not in locals():
-                    _, _, finish_reachable = _bfs_reachable_carrot_info(md, b.coord_src[0], b.coord_src[1])
-                # If finish was originally present but now isn't reachable, we broke the level
-                # self.map_obj could be used, but let's just rely on if 44 is in original map info
-                # Wait, we know `on_finish` checks `cur_tile == 44`.
-                # If there's 44 anywhere in original md, it must be reachable.
-                original_has_finish = (44 in self._fresh.data) if self._fresh else False
-                if original_has_finish and not finish_reachable:
-                    finish_lost = True
+
+        if destroyed_crumble:
+            # We just left a crumble, converting it to a spike (31)
+            px, py = b.coord_src
+            reachable_count, _, finish_reachable, _ = _bfs_reachable_carrot_info(md, px, py)
+            
+            if not all_collected:
+                remaining = (self._expected_carrots - b.carrot_count) + (self._expected_eggs - b.egg_count)
+                if reachable_count < remaining:
+                    carrots_lost = remaining - reachable_count
+            
+            # Check finish reachability
+            original_has_finish = (44 in self._fresh.data) if self._fresh else False
+            if original_has_finish and not finish_reachable:
+                finish_lost = True
 
         self.step_count += 1
         done = b.dead or on_finish or (self.step_count >= self.max_steps) or (carrots_lost > 0) or finish_lost
@@ -467,7 +463,7 @@ def _semantic_channels(env: FastBobbyEnv) -> Tuple[np.ndarray, np.ndarray]:
     if not all_collected:
         mask = (data_arr == 19) | (data_arr == 45)
         if mask.any():
-            _, bfs_dist, _ = _bfs_reachable_carrot_info(data_arr, px, py)
+            _, bfs_dist, _, _ = _bfs_reachable_carrot_info(data_arr, px, py)
             
             if bfs_dist >= 0:
                 md_norm = float(bfs_dist) / (GRID_SIZE * 2)
@@ -479,12 +475,17 @@ def _semantic_channels(env: FastBobbyEnv) -> Tuple[np.ndarray, np.ndarray]:
         else:
             md_norm = 0.0
     else:
-        fidx = np.where(data_arr == 44)[0]
-        if len(fidx):
-            fx, fy  = int(fidx[0] % GRID_SIZE), int(fidx[0] // GRID_SIZE)
-            md_norm = min(1.0, (abs(fx - px) + abs(fy - py)) / (GRID_SIZE * 2))
+        # Use BFS distance to finish if reachable, otherwise Manhattan fallback
+        _, _, fin_reach, fin_dist = _bfs_reachable_carrot_info(data_arr, px, py)
+        if fin_reach and fin_dist >= 0:
+            md_norm = float(fin_dist) / (GRID_SIZE * 2)
         else:
-            md_norm = 0.0
+            fidx = np.where(data_arr == 44)[0]
+            if len(fidx):
+                fx, fy  = int(fidx[0] % GRID_SIZE), int(fidx[0] // GRID_SIZE)
+                md_norm = min(1.0, (abs(fx - px) + abs(fy - py)) / (GRID_SIZE * 2))
+            else:
+                md_norm = 0.0
 
     inv = np.array([
         float(b.key_gray   > 0),
@@ -566,18 +567,6 @@ def _shape_reward(
     if info.get("finish_lost", False):
         # Heavy penalty for making finish tile unreachable
         r += cfg.reachability_loss_penalty * 2.0
-
-    # Crumble adjacency penalty
-    if env.bobby is not None and env.map_info is not None:
-        b  = env.bobby
-        md = env.map_info.data
-        px, py = b.coord_src
-        if md[px + py * GRID_SIZE] in (30, 31):
-            # Only penalize if we're not carrying out a collection phase
-            _, bfs_dist, _ = _bfs_reachable_carrot_info(md, px, py)
-            if bfs_dist > 1 and rq_carrots > 0:
-                crumble_scale = max(0.10, 1.0 - progress_frac)
-                r += cfg.crumble_penalty * crumble_scale
 
     # Anti-oscillation revisit penalty
     if visit_counts is not None and env.bobby is not None:
