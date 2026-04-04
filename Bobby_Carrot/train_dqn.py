@@ -84,9 +84,14 @@ _SWITCH_BLUE_NP = _SWITCH_BLUE.copy()
 # ─────────────────────────────────────────────────────────────
 
 def _bfs_reachable_carrot_info(md, sx, sy, grid_size=GRID_SIZE):
-    """BFS from (sx,sy). Return (reachable_carrot_count, nearest_bfs_dist, finish_reachable, finish_dist).
+    """Direction-aware BFS from (sx,sy).
 
-    Walkable tiles: tile >= 18 and tile not in {31, 46}.
+    Return (reachable_carrot_count, nearest_bfs_dist, finish_reachable, finish_dist).
+
+    Respects directional constraints:
+      - Arrows 24-27: rotating tiles with entry/exit restrictions
+      - Conveyors 40-43: one-way tiles
+      - Rails 28-29: horizontal/vertical only
     Spike (31) and broken-egg spike (46) are impassable.
     O(256) on a 16x16 grid — negligible overhead.
     """
@@ -102,6 +107,9 @@ def _bfs_reachable_carrot_info(md, sx, sy, grid_size=GRID_SIZE):
     finish_reachable = False
     finish_dist = -1
 
+    # Direction indices: 0=Left(-1,0), 1=Right(+1,0), 2=Up(0,-1), 3=Down(0,+1)
+    _DIRS = ((-1, 0, 0), (1, 0, 1), (0, -1, 2), (0, 1, 3))
+
     while q:
         x, y, dist = q.popleft()
         tile = md[x + y * grid_size]
@@ -115,17 +123,111 @@ def _bfs_reachable_carrot_info(md, sx, sy, grid_size=GRID_SIZE):
             if finish_dist < 0 or dist < finish_dist:
                 finish_dist = dist
 
-        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nx, ny = x + dx, y + dy
+        for ddx, ddy, d_idx in _DIRS:
+            # Check if we can EXIT current tile in this direction
+            if not _can_exit_tile(tile, d_idx):
+                continue
+
+            nx, ny = x + ddx, y + ddy
             if 0 <= nx < grid_size and 0 <= ny < grid_size:
                 ni = nx + ny * grid_size
                 if not visited[ni]:
                     nt = md[ni]
                     if nt >= 18 and nt != 31 and nt != 46:
-                        visited[ni] = 1
-                        q.append((nx, ny, dist + 1))
+                        # Check if we can ENTER neighbour tile from this direction
+                        if _can_enter_tile(nt, d_idx):
+                            visited[ni] = 1
+                            q.append((nx, ny, dist + 1))
 
     return reachable_count, nearest_dist, finish_reachable, finish_dist
+
+
+def _can_exit_tile(tile: int, direction: int) -> bool:
+    """Check if we can leave `tile` in `direction`.
+
+    direction: 0=Left, 1=Right, 2=Up, 3=Down
+
+    Derived from game.py update_dest old_item checks:
+      old_item==24 forbids {Left,Up}   → can exit Right(1), Down(3)
+      old_item==25 forbids {Right,Up}  → can exit Left(0),  Down(3)
+      old_item==26 forbids {Right,Down}→ can exit Left(0),  Up(2)
+      old_item==27 forbids {Left,Down} → can exit Right(1), Up(2)
+    """
+    # Arrow tiles: restrict exit directions
+    # 24: forbids Left,Up → can exit Right or Down
+    if tile == 24:
+        return direction in (1, 3)
+    # 25: forbids Right,Up → can exit Left or Down
+    if tile == 25:
+        return direction in (0, 3)
+    # 26: forbids Right,Down → can exit Left or Up
+    if tile == 26:
+        return direction in (0, 2)
+    # 27: forbids Left,Down → can exit Right or Up
+    if tile == 27:
+        return direction in (1, 2)
+    # Horizontal rail 28: Left or Right only (forbids Up,Down)
+    if tile == 28:
+        return direction in (0, 1)
+    # Vertical rail 29: Up or Down only (forbids Left,Right)
+    if tile == 29:
+        return direction in (2, 3)
+    # Conveyor Left 40: forbids Up,Down,Right → can only exit Left
+    if tile == 40:
+        return direction == 0
+    # Conveyor Right 41: forbids Up,Down,Left → can only exit Right
+    if tile == 41:
+        return direction == 1
+    # Conveyor Up 42: forbids Left,Right,Down → can only exit Up
+    if tile == 42:
+        return direction == 2
+    # Conveyor Down 43: forbids Left,Right,Up → can only exit Down
+    if tile == 43:
+        return direction == 3
+    # All other walkable tiles: no exit restriction
+    return True
+
+
+def _can_enter_tile(tile: int, direction: int) -> bool:
+    """Check if we can enter `tile` coming FROM `direction`.
+
+    direction: 0=Left, 1=Right, 2=Up, 3=Down
+    (the direction we are MOVING, not the side we enter from)
+    """
+    # Arrow tile entry restrictions (same as game.py update_dest)
+    # 24: cannot enter from Right or Down
+    if tile == 24:
+        return direction not in (1, 3)
+    # 25: cannot enter from Left or Down
+    if tile == 25:
+        return direction not in (0, 3)
+    # 26: cannot enter from Left or Up
+    if tile == 26:
+        return direction not in (0, 2)
+    # 27: cannot enter from Right or Up
+    if tile == 27:
+        return direction not in (1, 2)
+    # Horizontal rail 28: cannot enter from Up or Down
+    if tile == 28:
+        return direction in (0, 1)
+    # Vertical rail 29: cannot enter from Left or Right
+    if tile == 29:
+        return direction in (2, 3)
+    # Conveyor Left 40: cannot enter going Right, Up, or Down
+    if tile == 40:
+        return direction == 0
+    # Conveyor Right 41: cannot enter going Left, Up, or Down
+    if tile == 41:
+        return direction == 1
+    # Conveyor Up 42: cannot enter going Down, Left, or Right
+    if tile == 42:
+        return direction == 2
+    # Conveyor Down 43: cannot enter going Up, Left, or Right
+    if tile == 43:
+        return direction == 3
+    # Locked doors: BFS assumes optimistic (keys may be found)
+    # All other tiles: no entry restriction
+    return True
 
 
 # ─────────────────────────────────────────────────────────────
@@ -133,16 +235,16 @@ def _bfs_reachable_carrot_info(md, sx, sy, grid_size=GRID_SIZE):
 # ─────────────────────────────────────────────────────────────
 
 LEVEL_CONFIG: Dict[int, Dict] = {
-    1:  {"max_steps": 400,  "episodes": 2000, "distance_scale": 2.5, "post_penalty": -0.2},
-    2:  {"max_steps": 500,  "episodes": 2000, "distance_scale": 2.5, "post_penalty": -0.2},
-    3:  {"max_steps": 600,  "episodes": 2200, "distance_scale": 2.0, "post_penalty": -0.3},
-    4:  {"max_steps": 800,  "episodes": 5000, "distance_scale": 2.0, "post_penalty": -0.3},
-    5:  {"max_steps": 800,  "episodes": 5000, "distance_scale": 2.0, "post_penalty": -1.0},
-    6:  {"max_steps": 700,  "episodes": 2500, "distance_scale": 1.5, "post_penalty": -0.4},
-    7:  {"max_steps": 900,  "episodes": 3500, "distance_scale": 1.2, "post_penalty": -0.5},
-    8:  {"max_steps": 400,  "episodes": 2000, "distance_scale": 2.0, "post_penalty": -0.2},
-    9:  {"max_steps": 700,  "episodes": 2500, "distance_scale": 1.5, "post_penalty": -0.4},
-    10: {"max_steps": 600,  "episodes": 2500, "distance_scale": 1.8, "post_penalty": -0.3},
+    1:  {"max_steps": 400,  "episodes": 2000,  "distance_scale": 2.5, "post_penalty": -0.2},
+    2:  {"max_steps": 500,  "episodes": 2000,  "distance_scale": 2.5, "post_penalty": -0.2},
+    3:  {"max_steps": 600,  "episodes": 2200,  "distance_scale": 2.0, "post_penalty": -0.3},
+    4:  {"max_steps": 800,  "episodes": 5000,  "distance_scale": 2.0, "post_penalty": -0.3},
+    5:  {"max_steps": 1000, "episodes": 8000,  "distance_scale": 2.0, "post_penalty": -0.3},
+    6:  {"max_steps": 1200, "episodes": 10000, "distance_scale": 2.0, "post_penalty": -0.3},
+    7:  {"max_steps": 1500, "episodes": 15000, "distance_scale": 1.5, "post_penalty": -0.3},
+    8:  {"max_steps": 800,  "episodes": 5000,  "distance_scale": 2.0, "post_penalty": -0.3},
+    9:  {"max_steps": 1000, "episodes": 6000,  "distance_scale": 2.0, "post_penalty": -0.3},
+    10: {"max_steps": 1000, "episodes": 8000,  "distance_scale": 2.0, "post_penalty": -0.3},
 }
 
 def _get_level_cfg(level: int) -> Dict:
@@ -174,24 +276,25 @@ def _load_map_stats(map_kind: str, level: int) -> Dict[str, int]:
 @dataclass
 class DQNConfig:
     gamma:               float = 0.99
-    lr:                  float = 8e-4
+    lr:                  float = 3e-4       # lower LR for more stable convergence on hard levels
     batch_size:          int   = 256
-    replay_capacity:     int   = 100_000
+    replay_capacity:     int   = 200_000    # larger buffer for crumble-heavy levels
     min_replay_size:     int   = 512
     target_update_steps: int   = 500
     train_every_steps:   int   = 2          # every 2 steps (not 4 — too few updates)
     epsilon_start:       float = 1.0
-    epsilon_min:         float = 0.12
-    epsilon_decay:       float = 0.9993
+    epsilon_min:         float = 0.05       # lower floor — exploit more once learning kicks in
+    epsilon_decay:       float = 0.9996     # slower decay gives more exploration for harder levels
     completion_bonus:    float = 1200.0
     death_penalty:       float = -25.0
     carrot_bonus:        float = 18.0
     egg_bonus:           float = 18.0
     all_collected_bonus: float = 220.0
+    safe_crumble_bonus:  float = 5.0
     late_collection_bonus_scale: float = 6.0
-    incomplete_penalty:  float = -160.0
+    incomplete_penalty:  float = -80.0      # softer — allows more exploration before converging
     crumble_penalty:     float = -2.0
-    reachability_loss_penalty: float = -40.0  # per carrot made unreachable by crumble
+    reachability_loss_penalty: float = -50.0 # per carrot made unreachable by crumble (episode continues)
     invalid_move_penalty:float = -0.15
     step_penalty:        float = -0.005     # near-zero: don't drown the carrot signal
     revisit_penalty:     float = -0.04
@@ -203,7 +306,7 @@ class DQNConfig:
     seed:                int   = 42
     observation_mode:    str   = "full"
     use_amp:             bool  = True
-    pre_success_epsilon_floor: float = 0.35
+    pre_success_epsilon_floor: float = 0.25 # lower floor before first success
 
 
 # ─────────────────────────────────────────────────────────────
@@ -388,7 +491,10 @@ class FastBobbyEnv:
                 finish_lost = True
 
         self.step_count += 1
-        done = b.dead or on_finish or (self.step_count >= self.max_steps) or (carrots_lost > 0) or finish_lost
+        # FIX: Do NOT terminate on crumble reachability loss — let the agent
+        # continue and learn from the penalty. Terminating here killed 30%+ of
+        # episodes instantly on crumble-heavy levels (5,6,7), preventing learning.
+        done = b.dead or on_finish or (self.step_count >= self.max_steps)
         self.episode_done = done
 
         return 0.0, done, {
@@ -403,6 +509,7 @@ class FastBobbyEnv:
             "carrots_lost":     carrots_lost,
             "finish_lost":      finish_lost,
             "destroyed_crumble": destroyed_crumble,
+            "destroyed_crumble_safe": destroyed_crumble and carrots_lost == 0 and not finish_lost,
         }
 
     def _is_finished(self) -> bool:
@@ -558,6 +665,9 @@ def _shape_reward(
 
     if all_collected and not level_done:
         r += level_cfg["post_penalty"]
+
+    if info.get("destroyed_crumble_safe", False):
+        r += cfg.safe_crumble_bonus
 
     # Reachability loss penalty
     carrots_lost = info.get("carrots_lost", 0)
@@ -1118,18 +1228,18 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--episodes-per-level",  type=int,   default=None)
     p.add_argument("--max-steps",           type=int,   default=None)
     p.add_argument("--batch-size",          type=int,   default=256)
-    p.add_argument("--lr",                  type=float, default=8e-4)
+    p.add_argument("--lr",                  type=float, default=3e-4)
     p.add_argument("--gamma",               type=float, default=0.99)
     p.add_argument("--epsilon-start",       type=float, default=1.0)
-    p.add_argument("--epsilon-min",         type=float, default=0.12)
-    p.add_argument("--epsilon-decay",       type=float, default=0.9993)
+    p.add_argument("--epsilon-min",         type=float, default=0.05)
+    p.add_argument("--epsilon-decay",       type=float, default=0.9996)
     p.add_argument("--completion-bonus",    type=float, default=1200.0)
     p.add_argument("--death-penalty",       type=float, default=-25.0)
     p.add_argument("--carrot-bonus",        type=float, default=18.0)
     p.add_argument("--egg-bonus",           type=float, default=18.0)
     p.add_argument("--all-collected-bonus", type=float, default=220.0)
     p.add_argument("--late-collection-bonus-scale", type=float, default=6.0)
-    p.add_argument("--incomplete-penalty", type=float, default=-160.0)
+    p.add_argument("--incomplete-penalty", type=float, default=-80.0)
     p.add_argument("--crumble-penalty",     type=float, default=-2.0)
     p.add_argument("--invalid-move-penalty",type=float, default=-0.15)
     p.add_argument("--step-penalty",        type=float, default=-0.005)
@@ -1149,7 +1259,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--play-episodes",       type=int,   default=5)
     p.add_argument("--no-render",           action="store_true")
     p.add_argument("--render-fps",          type=float, default=5.0)
-    p.add_argument("--pre-success-epsilon-floor", type=float, default=0.35)
+    p.add_argument("--pre-success-epsilon-floor", type=float, default=0.25)
     p.add_argument("--resume",              action="store_true",
                    help="Resume from --model-path checkpoint if it exists")
     p.add_argument("--no-compile",          action="store_true")
