@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 # pyright: reportMissingImports=false
-
 import argparse
 import random
 import sys
@@ -11,18 +9,15 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
-
 import numpy as np
 
 _HERE = Path(__file__).resolve()
 ROOT = _HERE.parent
 while not (ROOT / "Game_Python").exists() and ROOT.parent != ROOT:
     ROOT = ROOT.parent
-
 GAME_PYTHON_DIR = ROOT / "Game_Python"
 if not GAME_PYTHON_DIR.exists():
     raise RuntimeError("Could not locate Game_Python directory for imports.")
-
 if str(GAME_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(GAME_PYTHON_DIR))
 
@@ -36,167 +31,166 @@ try:
 except Exception as exc:
     raise RuntimeError("PyTorch is required. Install with: pip install torch") from exc
 
-
 # ─────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────
-
 GRID_SIZE     = 16
-GRID_CHANNELS = 13
-INV_FEATURES  = 5   # key_gray, key_yellow, key_red, rem_norm, dist_norm
-                    # (reachable_frac removed — BFS too slow every step)
+GRID_CHANNELS = 14   # +1 channel: crumble-adjacency map
+INV_FEATURES  = 7    # +2: new_area_dist_norm, crumble_bonus_available
 
 _TILE_CH = np.zeros(256, dtype=np.int8)
 for _i in range(256):
-    if   _i < 18:                _TILE_CH[_i] = 0
-    elif _i == 19:               _TILE_CH[_i] = 1
-    elif _i == 45:               _TILE_CH[_i] = 2
-    elif _i == 44:               _TILE_CH[_i] = 4
-    elif _i in (31, 46):         _TILE_CH[_i] = 5
-    elif _i in (32, 34, 36):     _TILE_CH[_i] = 6
-    elif _i in (33, 35, 37):     _TILE_CH[_i] = 7
-    elif _i == 30:               _TILE_CH[_i] = 8
-    elif _i in (40, 41, 42, 43): _TILE_CH[_i] = 9
-    else:                        _TILE_CH[_i] = 10
+    if   _i < 18:                _TILE_CH[_i] = 0   # wall
+    elif _i == 18:               _TILE_CH[_i] = 1   # floor
+    elif _i == 19:               _TILE_CH[_i] = 2   # carrot
+    elif _i == 45:               _TILE_CH[_i] = 3   # egg
+    elif _i == 44:               _TILE_CH[_i] = 4   # finish (open) / 5 (locked)
+    elif _i in (31, 46):         _TILE_CH[_i] = 6   # spike / used egg
+    elif _i in (32, 34, 36):     _TILE_CH[_i] = 7   # key pickup
+    elif _i in (33, 35, 37):     _TILE_CH[_i] = 8   # locked door
+    elif _i == 30:               _TILE_CH[_i] = 9   # crumble ← explicit channel
+    elif _i in (40, 41, 42, 43): _TILE_CH[_i] = 10  # conveyor
+    elif _i == 22:               _TILE_CH[_i] = 11  # red switch
+    elif _i == 38:               _TILE_CH[_i] = 11  # blue switch
+    else:                        _TILE_CH[_i] = 12  # other
 
 _FLAT_IDX = np.arange(256, dtype=np.int32)
 _CH_BUF   = np.zeros(256, dtype=np.int8)
 _GRID_BUF = np.zeros((GRID_CHANNELS, 256), dtype=np.uint8)
-
 _RED_MAP  = {22:23, 23:22, 24:25, 25:26, 26:27, 27:24, 28:29, 29:28}
 _BLUE_MAP = {38:39, 39:38, 40:41, 41:40, 42:43, 43:42}
 
 
 # ─────────────────────────────────────────────────────────────
-# BFS — used for reachability checks AND distance-to-target.
-#
-# FIX 6: RE-ADD BFS distance to observation.
-# Manhattan distance was misleading — it ignores walls, so the agent
-# couldn't learn to navigate through corridors to wing areas in level 5.
-# BFS in a 16×16 grid with ~60 walkable tiles costs ~30–80µs per call.
-# At 110 sps that's <1% overhead — acceptable for correct guidance.
+# BFS utilities — wall-aware, spike-aware
 # ─────────────────────────────────────────────────────────────
 
-def _can_exit(tile: int, d: int) -> bool:
-    if tile < 24 or tile > 43 or (28 < tile < 40): return True
-    if tile == 24: return d in (1, 3)
-    if tile == 25: return d in (0, 3)
-    if tile == 26: return d in (0, 2)
-    if tile == 27: return d in (1, 2)
-    if tile == 28: return d in (0, 1)
-    if tile == 29: return d in (2, 3)
-    if tile == 40: return d == 0
-    if tile == 41: return d == 1
-    if tile == 42: return d == 2
-    if tile == 43: return d == 3
-    return True
-
-
-def _can_enter(tile: int, d: int) -> bool:
-    if tile < 24 or tile > 43 or (28 < tile < 40): return True
-    if tile == 24: return d not in (1, 3)
-    if tile == 25: return d not in (0, 3)
-    if tile == 26: return d not in (0, 2)
-    if tile == 27: return d not in (1, 2)
-    if tile == 28: return d in (0, 1)
-    if tile == 29: return d in (2, 3)
-    if tile == 40: return d == 0
-    if tile == 41: return d == 1
-    if tile == 42: return d == 2
-    if tile == 43: return d == 3
-    return True
-
-
-def _bfs(md: List[int], sx: int, sy: int) -> Tuple[int, bool, int]:
-    """BFS for reachability only (not distance).
-    Returns (reachable_carrot_count, finish_reachable, finish_dist).
-    Called only on crumble destruction events, not every step.
+def _bfs_full(md: List[int], sx: int, sy: int, spikes: Optional[set] = None) -> Dict[Tuple[int,int], int]:
+    """BFS returning distance-dict from (sx,sy). Treats spikes (tile 31) as walls.
+    Crumbles (tile 30) are PASSABLE (stepping them is a move).
+    Returns {(x,y): dist} for all reachable walkable tiles.
     """
-    visited = bytearray(256)
+    if spikes is None:
+        spikes = set()
+    dist_map: Dict[Tuple[int,int], int] = {}
     q: deque = deque()
     q.append((sx, sy, 0))
-    visited[sx + sy * 16] = 1
-    _DIRS = ((-1, 0, 0), (1, 0, 1), (0, -1, 2), (0, 1, 3))
-    rc = 0; fr = False; fd = -1
+    dist_map[(sx, sy)] = 0
     while q:
-        x, y, dist = q.popleft()
-        tile = md[x + y * 16]
-        if tile == 19 or tile == 45: rc += 1
-        elif tile == 44:
+        x, y, d = q.popleft()
+        for dx, dy in ((-1,0),(1,0),(0,-1),(0,1)):
+            nx, ny = x+dx, y+dy
+            if 0 <= nx < 16 and 0 <= ny < 16 and (nx,ny) not in dist_map:
+                if (nx,ny) in spikes:
+                    continue
+                nt = md[nx+ny*16]
+                if nt >= 18:   # passable: floor, crumble, carrot, finish, etc.
+                    dist_map[(nx,ny)] = d+1
+                    q.append((nx, ny, d+1))
+    return dist_map
+
+
+def _bfs_reachability(md: List[int], sx: int, sy: int) -> Tuple[int, bool, int]:
+    """Reachability BFS: returns (reachable_targets, finish_reachable, finish_dist).
+    Used for crumble safety checks. Spikes treated as walls, crumbles passable.
+    """
+    dist_map = _bfs_full(md, sx, sy)
+    rc = 0; fr = False; fd = 9999
+    for (x,y), d in dist_map.items():
+        t = md[x+y*16]
+        if t == 19 or t == 45:
+            rc += 1
+        elif t == 44:
             fr = True
-            if fd < 0 or dist < fd: fd = dist
-        for ddx, ddy, di in _DIRS:
-            if not _can_exit(tile, di): continue
-            nx, ny = x + ddx, y + ddy
-            if 0 <= nx < 16 and 0 <= ny < 16:
-                ni = nx + ny * 16
-                if not visited[ni]:
-                    nt = md[ni]
-                    if nt >= 18 and nt != 31 and nt != 46 and _can_enter(nt, di):
-                        visited[ni] = 1
-                        q.append((nx, ny, dist + 1))
-    return rc, fr, fd
+            fd = min(fd, d)
+    return rc, fr, (fd if fr else -1)
 
 
-def _bfs_dist_nearest(md: List[int], sx: int, sy: int, all_collected: bool) -> int:
-    """BFS distance to nearest uncollected carrot/egg, or finish if all collected.
-    Uses wall-aware pathfinding (not Manhattan). Ignores directional constraints
-    for speed — good enough for distance guidance.
-    Returns distance (0..32). 32 means unreachable.
+def _bfs_nearest_target(md: List[int], sx: int, sy: int, all_collected: bool) -> int:
+    """BFS distance to nearest uncollected carrot/egg (or finish if all_collected).
+    Fully wall-aware and spike-aware. Returns 32 if unreachable.
     """
-    visited = bytearray(256)
-    q: deque = deque()
-    si = sx + sy * 16
-    q.append((sx, sy, 0))
-    visited[si] = 1
-    while q:
-        x, y, dist = q.popleft()
-        tile = md[x + y * 16]
+    dist_map = _bfs_full(md, sx, sy)
+    best = 32
+    for (x,y), d in dist_map.items():
+        t = md[x+y*16]
         if all_collected:
-            if tile == 44:
-                return dist
+            if t == 44:
+                best = min(best, d)
         else:
-            if tile == 19 or tile == 45:
-                return dist
-        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-            nx, ny = x + dx, y + dy
-            if 0 <= nx < 16 and 0 <= ny < 16:
-                ni = nx + ny * 16
-                if not visited[ni]:
-                    nt = md[ni]
-                    if nt >= 18 and nt != 31 and nt != 46:
-                        visited[ni] = 1
-                        q.append((nx, ny, dist + 1))
-    return 32  # unreachable
+            if t == 19 or t == 45:
+                best = min(best, d)
+    return best
+
+
+def _count_reachable_targets(md: List[int], sx: int, sy: int) -> int:
+    """Count reachable uncollected carrots/eggs via BFS."""
+    dist_map = _bfs_full(md, sx, sy)
+    count = 0
+    for (x,y) in dist_map:
+        t = md[x+y*16]
+        if t == 19 or t == 45:
+            count += 1
+    return count
+
+
+def _build_crumble_adjacency(md: List[int]) -> np.ndarray:
+    """Build a 16x16 binary map: 1 where stepping that floor tile puts you
+    adjacent to an unstepped crumble. Helps agent identify crumble opportunities.
+    """
+    arr = np.zeros(256, dtype=np.uint8)
+    for y in range(16):
+        for x in range(16):
+            t = md[x+y*16]
+            if t < 18:
+                continue
+            for dx, dy in ((-1,0),(1,0),(0,-1),(0,1)):
+                nx, ny = x+dx, y+dy
+                if 0 <= nx < 16 and 0 <= ny < 16:
+                    if md[nx+ny*16] == 30:   # crumble neighbour
+                        arr[x+y*16] = 1
+                        break
+    return arr
 
 
 # ─────────────────────────────────────────────────────────────
-# Per-level config — tuned from actual map analysis
-#
-# Level 5: 19 carrots, 7 crumbles. Greedy path = 62 steps.
-# Level 6: 24 carrots, 11 crumbles. Greedy path = 65 steps.
-# Level 7: 34 carrots, 24 crumbles. Greedy path = 84 steps.
-# max_steps = greedy * 4 + buffer (enough for learning, not wasteful)
+# Per-level config
 # ─────────────────────────────────────────────────────────────
 
 LEVEL_CONFIG: Dict[int, Dict] = {
-    1:  {"max_steps": 250,  "episodes": 2000, "distance_scale": 3.0, "post_penalty": -0.5},
-    2:  {"max_steps": 280,  "episodes": 2000, "distance_scale": 3.0, "post_penalty": -0.5},
-    3:  {"max_steps": 320,  "episodes": 2500, "distance_scale": 2.5, "post_penalty": -0.5},
-    4:  {"max_steps": 400,  "episodes": 3000, "distance_scale": 2.5, "post_penalty": -0.5},
-    5:  {"max_steps": 500,  "episodes": 8000, "distance_scale": 3.0, "post_penalty": -0.3},
-    6:  {"max_steps": 450,  "episodes": 6000, "distance_scale": 2.5, "post_penalty": -0.3},
-    7:  {"max_steps": 550,  "episodes": 8000, "distance_scale": 2.5, "post_penalty": -0.3},
-    8:  {"max_steps": 400,  "episodes": 3000, "distance_scale": 2.5, "post_penalty": -0.5},
-    9:  {"max_steps": 450,  "episodes": 4000, "distance_scale": 2.5, "post_penalty": -0.5},
-    10: {"max_steps": 500,  "episodes": 5000, "distance_scale": 2.5, "post_penalty": -0.5},
+    1:  {"max_steps": 250,  "episodes": 2000,  "distance_scale": 2.0, "post_penalty": -0.5},
+    2:  {"max_steps": 280,  "episodes": 2000,  "distance_scale": 2.0, "post_penalty": -0.5},
+    3:  {"max_steps": 320,  "episodes": 2500,  "distance_scale": 2.0, "post_penalty": -0.5},
+    4:  {"max_steps": 400,  "episodes": 3000,  "distance_scale": 2.0, "post_penalty": -0.5},
+    # ── Level 5: 7 isolated components, all gated by crumbles ──────────────────
+    # Correct path requires stepping (7,9) horizontally (not vertically!),
+    # then (7,7), then (7,5) for finish.  Wings via (1,8)+(1,4) and (13,8)+(13,4).
+    # Needs far more episodes and a high crumble_area_bonus to reward bridge steps.
+    5:  {"max_steps": 600,  "episodes": 15000, "distance_scale": 2.0, "post_penalty": -0.1,
+         "crumble_area_bonus": 25.0,   # big reward per newly reachable carrot after crumble step
+         "stall_steps": 350,           # longer patience for multi-crumble paths
+         "new_tile_bonus": 0.8},       # stronger exploration bonus
+    # ── Level 6: 6 components, complex crumble graph ────────────────────────────
+    6:  {"max_steps": 550,  "episodes": 12000, "distance_scale": 2.0, "post_penalty": -0.1,
+         "crumble_area_bonus": 25.0,
+         "stall_steps": 350,
+         "new_tile_bonus": 0.8},
+    7:  {"max_steps": 650,  "episodes": 10000, "distance_scale": 2.0, "post_penalty": -0.3,
+         "crumble_area_bonus": 20.0, "stall_steps": 300, "new_tile_bonus": 0.5},
+    8:  {"max_steps": 400,  "episodes": 3000,  "distance_scale": 2.0, "post_penalty": -0.5},
+    9:  {"max_steps": 450,  "episodes": 4000,  "distance_scale": 2.0, "post_penalty": -0.5},
+    10: {"max_steps": 500,  "episodes": 5000,  "distance_scale": 2.0, "post_penalty": -0.5},
 }
 
 def _get_level_cfg(level: int) -> Dict:
-    return LEVEL_CONFIG.get(level, {
+    base = {
         "max_steps": 350, "episodes": 3000,
         "distance_scale": 2.0, "post_penalty": -0.5,
-    })
+        "crumble_area_bonus": 15.0, "stall_steps": 200, "new_tile_bonus": 0.3,
+    }
+    cfg = dict(base)
+    cfg.update(LEVEL_CONFIG.get(level, {}))
+    return cfg
 
 
 @lru_cache(maxsize=64)
@@ -219,32 +213,27 @@ def _load_map_stats(map_kind: str, level: int) -> Dict[str, int]:
 @dataclass
 class DQNConfig:
     gamma:               float = 0.99
-    lr:                  float = 5e-4
+    lr:                  float = 3e-4
     batch_size:          int   = 256
-    replay_capacity:     int   = 80_000
-    min_replay_size:     int   = 512
-    target_update_steps: int   = 400
+    replay_capacity:     int   = 120_000
+    min_replay_size:     int   = 1024
+    target_update_steps: int   = 500
     train_every_steps:   int   = 2
     epsilon_start:       float = 1.0
     epsilon_min:         float = 0.03
-    epsilon_decay:       float = 0.9994
-
-    # BUG 4 FIX: death_penalty must be larger than max carrot gain per episode
-    # so dying is NEVER profitable. With carrot_bonus=30 and avg ~13 carrots before
-    # dying: 13*30=390 carrot reward. death_penalty must exceed this.
-    # Setting death_penalty=-150 ensures: even collecting 5 carrots then dying = net negative
-    # (5*30 - 150 = 0, so marginal). With 0 carrots: -150. Strongly discourages dying.
+    epsilon_decay:       float = 0.9997   # slower decay → more exploration for complex levels
     death_penalty:       float = -150.0
-
     carrot_bonus:        float = 30.0
     egg_bonus:           float = 30.0
     completion_bonus:    float = 500.0
     all_collected_bonus: float = 100.0
-    safe_crumble_bonus:  float = 3.0
-    late_bonus_scale:    float = 5.0
+    # ── crumble-area reward: fired when a crumble step increases reachable targets ──
+    # This is the KEY missing signal in the original code.
+    crumble_area_bonus:  float = 25.0    # per newly reachable carrot
+    safe_crumble_bonus:  float = 5.0     # small bonus when crumble is safe AND opens area
     reachability_loss_penalty: float = -80.0
+    finish_loss_penalty: float = -160.0
     incomplete_penalty:  float = -30.0
-    crumble_penalty:     float = -1.0
     invalid_move_penalty:float = -0.1
     step_penalty:        float = -0.01
     revisit_penalty:     float = -0.03
@@ -252,23 +241,16 @@ class DQNConfig:
     terminal_oversample: int   = 20
     all_collected_oversample: int = 5
     warmup_episodes:     int   = 10
-    # FIX 6: stall_steps increased — agent needs time to navigate corridors
-    # between carrot clusters (e.g. inner area → wing corridors in level 5)
-    stall_steps:         int   = 200
+    stall_steps:         int   = 200     # overridden per level
     report_every:        int   = 100
-    save_every:          int   = 250
+    save_every:          int   = 500
     seed:                int   = 42
-    observation_mode:    str   = "full"
     use_amp:             bool  = True
-    # FIX 3: Remove pre_success_eps_floor entirely (set to 0.0 = disabled).
-    # The old value of 0.15 meant epsilon never dropped below 15% until first success.
-    # Since collected was always 0%, success never happened, epsilon was permanently 0.15.
-    # At 15% random, the agent near crumbles makes wrong moves → dies → never succeeds.
-    pre_success_eps_floor: float = 0.0   # 0.0 = disabled
+    pre_success_eps_floor: float = 0.0   # disabled
 
 
 # ─────────────────────────────────────────────────────────────
-# _apply_switch — pure Python dict (no numpy round-trip)
+# _apply_switch
 # ─────────────────────────────────────────────────────────────
 
 def _apply_switch(md: List[int], tile: int) -> None:
@@ -284,7 +266,7 @@ def _apply_switch(md: List[int], tile: int) -> None:
 # ─────────────────────────────────────────────────────────────
 
 class FastBobbyEnv:
-    """One game-logic step per RL step. Death on spikes = real game behavior."""
+    """Single-step game-logic environment. Death on spikes = real game."""
 
     ACTIONS = [State.Left, State.Right, State.Up, State.Down]
 
@@ -301,9 +283,10 @@ class FastBobbyEnv:
         self.action_space_n = 4
         self._expected_carrots: int = 0
         self._expected_eggs:    int = 0
-        # BFS cache for reachability checks (only on crumble events, not every step)
-        self._bfs_cache: Dict[Tuple[int, int, int], Tuple] = {}
+        self._bfs_cache: Dict[Tuple[int, ...], Tuple] = {}
         self._map_state_id: int = 0
+        # Track visited tiles for new-tile bonus
+        self._visited_tiles: set = set()
 
     def set_map(self, map_kind: str, map_number: int) -> None:
         if map_kind != self.map_kind or map_number != self.map_number:
@@ -331,6 +314,7 @@ class FastBobbyEnv:
         self.episode_done = False
         self._bfs_cache.clear()
         self._map_state_id = 0
+        self._visited_tiles = {mi.coord_start}
 
     def step(self, action: int) -> Tuple[float, bool, Dict[str, object]]:
         assert self.bobby is not None and self.map_info is not None
@@ -351,34 +335,25 @@ class FastBobbyEnv:
         b.coord_dest = b.coord_src
         b.update_dest(md)
 
-        # ─────────────────────────────────────────────────────
-        # BUG 1 FIX: REMOVE spike-blocking entirely.
-        #
-        # Previous code:
-        #   if md[dp] == 31: b.coord_dest = b.coord_src  ← WRONG
-        #
-        # Why it caused collected=0%:
-        #   Level 5 has isolated carrot columns (left/right) accessible ONLY via
-        #   crumble bridges. If the agent steps both crumbles in wrong order,
-        #   both become spikes and seal the column permanently.
-        #   With spike-blocking: agent is silently trapped (no death, no restart).
-        #   It loops collecting ~70% of carrots forever, never completing.
-        #   The agent has NO signal that it ordered crumbles incorrectly.
-        #
-        # Fix: let the agent DIE on spikes, exactly as in the real game.
-        #   Death (-150 penalty) + episode restart = the correct training signal.
-        #   The agent rapidly learns to avoid re-entering spiked crumbles.
-        # ─────────────────────────────────────────────────────
-
         invalid_move = (b.coord_dest == b.coord_src)
         moved        = (b.coord_src  != b.coord_dest)
         map_mutated  = False
-        ot           = 0   # old tile (leaving tile)
+        ot           = 0
+        destroyed_crumble = False
+        reachable_before  = 0
+        finish_reachable_before = False
 
         if moved:
             old_pos = b.coord_src[0]  + b.coord_src[1]  * GRID_SIZE
             new_pos = b.coord_dest[0] + b.coord_dest[1] * GRID_SIZE
             ot = md[old_pos]
+
+            # ── Measure reachability BEFORE any crumble is destroyed ──────────
+            if ot == 30:
+                destroyed_crumble = True
+                px, py = b.coord_src
+                reachable_before = _count_reachable_targets(md, px, py)
+                _, finish_reachable_before, _ = _bfs_reachability(md, px, py)
 
             # Leaving tile
             if   ot == 24: md[old_pos] = 25; map_mutated = True
@@ -405,7 +380,7 @@ class FastBobbyEnv:
             elif nt == 41: b.next_state = State.Right
             elif nt == 42: b.next_state = State.Up
             elif nt == 43: b.next_state = State.Down
-            elif nt == 31: b.dead = True   # spike kills on entry — real game behavior
+            elif nt == 31: b.dead = True
 
             b.coord_src = b.coord_dest
 
@@ -413,50 +388,62 @@ class FastBobbyEnv:
             self._map_state_id += 1
             self._bfs_cache.clear()
 
-        # Death check on current tile (agent may already be on spike from last move)
         cur_pos  = b.coord_src[0] + b.coord_src[1] * GRID_SIZE
         cur_tile = md[cur_pos]
         if cur_tile == 31:
             b.dead = True
 
+        # ── New tile tracking ──────────────────────────────────────────────────
+        is_new_tile = b.coord_src not in self._visited_tiles
+        if moved:
+            self._visited_tiles.add(b.coord_src)
+
         all_collected = self._is_finished()
         on_finish     = (cur_tile == 44) and all_collected and not b.dead
+        carrot_delta  = b.carrot_count - before_carrot
+        egg_delta     = b.egg_count    - before_egg
 
-        carrot_delta = b.carrot_count - before_carrot
-        egg_delta    = b.egg_count    - before_egg
+        # ── Crumble-area reward: newly reachable carrots AFTER stepping crumble ─
+        # This is the KEY signal that was missing. The agent must be rewarded
+        # for stepping crumbles that open new carrot clusters, not just penalised
+        # for stepping ones that close them off.
+        newly_reachable = 0
+        finish_newly_lost = False
+        carrots_lost = 0
 
-        # Reachability check — only on crumble destruction (not every step)
-        destroyed_crumble = moved and ot == 30
-        carrots_lost = 0; finish_lost = False
-        if destroyed_crumble and not all_collected:
+        if destroyed_crumble and not b.dead:
             px, py = b.coord_src
-            key = (self._map_state_id, px, py)
-            if key not in self._bfs_cache:
-                self._bfs_cache[key] = _bfs(md, px, py)
-            rc, fr, fd = self._bfs_cache[key]
-            remaining = (self._expected_carrots - b.carrot_count) + (self._expected_eggs - b.egg_count)
-            if rc < remaining:
-                carrots_lost = remaining - rc
-            if self._fresh and (44 in self._fresh.data) and not fr:
-                finish_lost = True
+            reachable_after = _count_reachable_targets(md, px, py)
+            _, finish_reachable_after, _ = _bfs_reachability(md, px, py)
+
+            # Positive: opened new areas
+            if reachable_after > reachable_before:
+                newly_reachable = reachable_after - reachable_before
+            # Negative: closed off carrots
+            if reachable_after < reachable_before:
+                carrots_lost = reachable_before - reachable_after
+            # Finish loss
+            if finish_reachable_before and not finish_reachable_after:
+                finish_newly_lost = True
 
         self.step_count += 1
         done = b.dead or on_finish or (self.step_count >= self.max_steps)
         self.episode_done = done
 
         return 0.0, done, {
-            "collected_carrot":      carrot_delta,
-            "collected_egg":         egg_delta,
-            "all_collected":         all_collected,
-            "invalid_move":          invalid_move,
-            "dead":                  b.dead,
-            "level_completed":       on_finish,
-            "position":              b.coord_src,
-            "moved":                 moved,
-            "carrots_lost":          carrots_lost,
-            "finish_lost":           finish_lost,
-            "destroyed_crumble":     destroyed_crumble,
-            "destroyed_crumble_safe": destroyed_crumble and carrots_lost == 0 and not finish_lost,
+            "collected_carrot":       carrot_delta,
+            "collected_egg":          egg_delta,
+            "all_collected":          all_collected,
+            "invalid_move":           invalid_move,
+            "dead":                   b.dead,
+            "level_completed":        on_finish,
+            "position":               b.coord_src,
+            "moved":                  moved,
+            "carrots_lost":           carrots_lost,
+            "finish_lost":            finish_newly_lost,
+            "destroyed_crumble":      destroyed_crumble,
+            "newly_reachable":        newly_reachable,  # ← NEW: bonus signal
+            "is_new_tile":            is_new_tile,      # ← NEW: for stall counter
         }
 
     def _is_finished(self) -> bool:
@@ -474,10 +461,6 @@ class FastBobbyEnv:
 
 # ─────────────────────────────────────────────────────────────
 # Observation encoding
-#
-# FIX 6: Use BFS distance (wall-aware) instead of Manhattan.
-# Manhattan ignores walls → agent can't learn corridor navigation.
-# BFS in 16×16 grid costs ~30–80µs. At 110 sps = <1% overhead.
 # ─────────────────────────────────────────────────────────────
 
 def _semantic_channels(env: FastBobbyEnv) -> Tuple[np.ndarray, np.ndarray]:
@@ -489,24 +472,43 @@ def _semantic_channels(env: FastBobbyEnv) -> Tuple[np.ndarray, np.ndarray]:
     all_collected = env._is_finished()
 
     np.copyto(_CH_BUF, _TILE_CH[data_arr])
-    _CH_BUF[data_arr == 44] = 3 if all_collected else 4
+    # finish channel: 4 = locked, 5 = open
+    _CH_BUF[data_arr == 44] = 5 if all_collected else 4
 
     _GRID_BUF.fill(0)
-    _GRID_BUF[_CH_BUF.astype(np.int32), _FLAT_IDX] = 1
+    for ch in range(13):
+        mask = (_CH_BUF == ch)
+        _GRID_BUF[ch][mask] = 1
+
+    # Channel 13: crumble-adjacency (tiles next to an unstepped crumble)
+    crumble_adj = _build_crumble_adjacency(mi.data)
+    _GRID_BUF[13] = crumble_adj
+
     grid = _GRID_BUF.reshape(GRID_CHANNELS, GRID_SIZE, GRID_SIZE).copy()
 
+    # Agent position marker (overlay on channel 1 = floor)
     px, py = b.coord_src
-    grid[11, py, px] = 1
+    grid[1, py, px] = 2   # distinguishable value
+
     if all_collected:
-        grid[12, :, :] = 1
+        grid[5, :, :] = 1   # broadcast "finish open" hint
 
     remaining = max(0, (mi.carrot_total - b.carrot_count) + (mi.egg_total - b.egg_count))
     denom     = max(1, mi.carrot_total + mi.egg_total)
     rem_norm  = min(1.0, remaining / denom)
 
-    # BFS distance to nearest target (wall-aware pathfinding)
-    bfs_dist = _bfs_dist_nearest(mi.data, px, py, all_collected)
+    # BFS distance — fully wall-aware, spike-aware
+    bfs_dist  = _bfs_nearest_target(mi.data, px, py, all_collected)
     dist_norm = min(1.0, bfs_dist / (GRID_SIZE * 2))
+
+    # Newly reachable carrot count if we step the nearest crumble
+    # (gives the agent a forward-looking signal about crumble value)
+    crumble_bonus_signal = _crumble_forward_value(mi.data, px, py)
+    crumble_bonus_norm   = min(1.0, crumble_bonus_signal / max(1, remaining))
+
+    # Distance to nearest crumble
+    crumble_dist = _bfs_nearest_crumble(mi.data, px, py)
+    crumble_dist_norm = min(1.0, crumble_dist / (GRID_SIZE * 2))
 
     inv = np.array([
         float(b.key_gray   > 0),
@@ -514,9 +516,43 @@ def _semantic_channels(env: FastBobbyEnv) -> Tuple[np.ndarray, np.ndarray]:
         float(b.key_red    > 0),
         rem_norm,
         dist_norm,
+        crumble_bonus_norm,   # ← NEW: how many new carrots would nearest crumble open
+        crumble_dist_norm,    # ← NEW: how far to nearest crumble
     ], dtype=np.float32)
 
     return grid, inv
+
+
+def _crumble_forward_value(md: List[int], px: int, py: int) -> int:
+    """Estimate how many new carrots the NEAREST crumble (if stepped) would unlock.
+    Fast heuristic: find nearest crumble via BFS, simulate stepping it, count new reachable.
+    """
+    dist_map = _bfs_full(md, px, py)
+    best_crumble = None
+    best_dist = 9999
+    for (x,y), d in dist_map.items():
+        if md[x+y*16] == 30 and d < best_dist:
+            best_dist = d
+            best_crumble = (x,y)
+    if best_crumble is None:
+        return 0
+    before = _count_reachable_targets(md, px, py)
+    # Simulate: step that crumble (it becomes spike)
+    md2 = md.copy()
+    md2[best_crumble[0] + best_crumble[1]*16] = 31
+    # Agent would be on the other side
+    after = _count_reachable_targets(md2, px, py)
+    return max(0, after - before)
+
+
+def _bfs_nearest_crumble(md: List[int], px: int, py: int) -> int:
+    """BFS distance to nearest unstepped crumble tile."""
+    dist_map = _bfs_full(md, px, py)
+    best = 32
+    for (x,y), d in dist_map.items():
+        if md[x+y*16] == 30:
+            best = min(best, d)
+    return best
 
 
 # ─────────────────────────────────────────────────────────────
@@ -535,12 +571,13 @@ def _shape_reward(
     r = cfg.step_penalty
 
     if info["invalid_move"]: r += cfg.invalid_move_penalty
-    if info["dead"]:         r += cfg.death_penalty  # -150: dying is NEVER profitable
+    if info["dead"]:         r += cfg.death_penalty
 
     carrot_delta = int(info["collected_carrot"])
     egg_delta    = int(info["collected_egg"])
     b            = env.bobby
     mi           = env.map_info
+
     progress_frac = 0.0
     if b is not None and mi is not None:
         total = mi.carrot_total + mi.egg_total
@@ -549,10 +586,10 @@ def _shape_reward(
 
     if carrot_delta > 0:
         r += cfg.carrot_bonus * carrot_delta
-        r += cfg.late_bonus_scale * progress_frac * carrot_delta  # last carrots worth more
+        r += 5.0 * progress_frac * carrot_delta   # late carrots worth more
     if egg_delta > 0:
         r += cfg.egg_bonus * egg_delta
-        r += cfg.late_bonus_scale * progress_frac * egg_delta
+        r += 5.0 * progress_frac * egg_delta
 
     if info["level_completed"]:
         r += cfg.completion_bonus
@@ -560,39 +597,49 @@ def _shape_reward(
     all_collected = bool(info["all_collected"])
     level_done    = bool(info["level_completed"])
 
-    # All-collected bonus fires once on transition step
+    # All-collected bonus (fires once on the collection step)
     if all_collected and (carrot_delta > 0 or egg_delta > 0):
         if b is not None and mi is not None:
             if b.carrot_count + b.egg_count >= mi.carrot_total + mi.egg_total:
                 r += cfg.all_collected_bonus
 
-    # Distance shaping (Manhattan-based — inv[4])
+    # ── Distance shaping using BFS-corrected distances ────────────────────────
+    # inv[4] = BFS dist_norm. Decrease = moving closer = positive reward.
     dist_delta = float(prev_inv[4]) - float(curr_inv[4])
     r += level_cfg["distance_scale"] * dist_delta
 
-    if all_collected and not level_done:
-        r += level_cfg["post_penalty"]
+    # ── Crumble-area reward: KEY FIX ─────────────────────────────────────────
+    # Reward agent for stepping crumbles that open new carrot clusters.
+    # This was the missing signal causing the 70-78% plateau in level 5.
+    newly_reachable = int(info.get("newly_reachable", 0))
+    if newly_reachable > 0:
+        crumble_area_bonus = level_cfg.get("crumble_area_bonus", cfg.crumble_area_bonus)
+        r += crumble_area_bonus * newly_reachable
+        r += cfg.safe_crumble_bonus   # small extra for the safe step itself
 
-    if info.get("destroyed_crumble_safe"):
-        r += cfg.safe_crumble_bonus
-
-    # Reachability loss penalty (only fires on crumble destruction)
+    # Penalty for destroying access to carrots/finish
     carrots_lost = int(info.get("carrots_lost", 0))
     if carrots_lost > 0:
         r += cfg.reachability_loss_penalty * carrots_lost
     if info.get("finish_lost"):
-        r += cfg.reachability_loss_penalty * 2.0
+        r += cfg.finish_loss_penalty
 
-    # Revisit penalty (scaled down as progress increases)
+    # Post-collection: penalise wandering after all collected but not at finish
+    if all_collected and not level_done:
+        r += level_cfg["post_penalty"]
+
+    # Revisit penalty + new-tile bonus — using visit_counts array
     if visit_counts is not None and b is not None:
         vx, vy = b.coord_src
         visits = int(visit_counts[vx + vy * GRID_SIZE])
         if visits > 2:
             scale = max(0.05, 1.0 - 1.2 * progress_frac)
             r += cfg.revisit_penalty * scale * min(visits - 2, 5)
-        # New-tile exploration bonus — encourage discovering corridors
-        if visits == 1:
-            r += cfg.new_tile_bonus
+
+    # New-tile bonus from info flag (simpler than visit count for new areas)
+    if bool(info.get("is_new_tile")):
+        new_tile_bonus = level_cfg.get("new_tile_bonus", cfg.new_tile_bonus)
+        r += new_tile_bonus
 
     return r
 
@@ -619,8 +666,8 @@ class ReplayBuffer:
 
     def push(self, grid, inv, action, reward, next_grid, next_inv, done) -> None:
         i           = self._ptr
-        self._sg[i] = grid;     self._sv[i] = inv
-        self._a[i]  = action;   self._r[i]  = reward
+        self._sg[i] = grid;      self._sv[i] = inv
+        self._a[i]  = action;    self._r[i]  = reward
         self._ng[i] = next_grid; self._nv[i] = next_inv
         self._d[i]  = float(done)
         self._ptr   = (i + 1) % self._cap
@@ -691,12 +738,10 @@ class DQNAgent:
         self.device      = device
         self.epsilon     = cfg.epsilon_start
         self.total_steps = 0
-
         self.policy_net = DuelingDQNCNN(n_actions).to(device)
         self.target_net = DuelingDQNCNN(n_actions).to(device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
         self.target_net.eval()
-
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=cfg.lr, eps=1.5e-4)
         self.loss_fn   = nn.SmoothL1Loss()
         self.replay    = ReplayBuffer(cfg.replay_capacity)
@@ -716,7 +761,6 @@ class DQNAgent:
             return None
         if self.total_steps % self.cfg.train_every_steps != 0:
             return None
-
         sg, sv, acts, rwds, nsg, nsv, dones = self.replay.sample(self.cfg.batch_size)
         sg_t  = torch.from_numpy(sg).to(self.device,    non_blocking=True)
         sv_t  = torch.from_numpy(sv).to(self.device,    non_blocking=True)
@@ -725,7 +769,6 @@ class DQNAgent:
         nsg_t = torch.from_numpy(nsg).to(self.device,   non_blocking=True)
         nsv_t = torch.from_numpy(nsv).to(self.device,   non_blocking=True)
         d_t   = torch.from_numpy(dones).to(self.device, non_blocking=True)
-
         if self.use_amp:
             with torch.amp.autocast("cuda"):
                 q_pred = self.policy_net(sg_t, sv_t).gather(1, a_t).squeeze(1)
@@ -751,10 +794,8 @@ class DQNAgent:
             loss.backward()
             nn.utils.clip_grad_norm_(self.policy_net.parameters(), 10.0)
             self.optimizer.step()
-
         if self.total_steps % self.cfg.target_update_steps == 0:
             self.target_net.load_state_dict(self.policy_net.state_dict())
-
         return float(loss.item())
 
     def decay_epsilon(self) -> None:
@@ -794,10 +835,8 @@ def _seed_everything(seed: int) -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32       = True
 
-
 def _make_env(map_kind: str, level: int, max_steps: int) -> FastBobbyEnv:
     return FastBobbyEnv(map_kind=map_kind, map_number=level, max_steps=max_steps)
-
 
 def _maybe_compile(model: nn.Module, device: torch.device) -> nn.Module:
     if not hasattr(torch, "compile") or device.type != "cuda":
@@ -822,10 +861,11 @@ def train_one_level(
     target_success_rate: float = 0.90,
     ckpt_path:           Optional[Path] = None,
 ) -> Dict[str, float]:
-
     level_cfg  = _get_level_cfg(level)
     max_steps  = level_cfg["max_steps"]
     n_episodes = level_cfg["episodes"]
+    # Per-level stall override
+    stall_steps = level_cfg.get("stall_steps", cfg.stall_steps)
     stats      = _load_map_stats(map_kind, level)
     env        = _make_env(map_kind, level, max_steps)
 
@@ -834,7 +874,7 @@ def train_one_level(
     collected_hist:List[float] = []
     progress_hist: List[float] = []
     loss_win: Deque[float]     = deque(maxlen=cfg.report_every)
-    best_success = -1.0
+    best_success   = -1.0
     early_stop_wins = 0
     stagnation_ctr  = 0
     ever_succeeded  = False
@@ -842,6 +882,8 @@ def train_one_level(
 
     print(f"  max_steps={max_steps} | episodes={n_episodes} | "
           f"dist={level_cfg['distance_scale']} | post={level_cfg['post_penalty']} | "
+          f"crumble_area_bonus={level_cfg.get('crumble_area_bonus', cfg.crumble_area_bonus)} | "
+          f"stall={stall_steps} | "
           f"carrots={stats['carrots']} crumbles={stats['crumbles']} | "
           f"death_penalty={cfg.death_penalty} | carrot_bonus={cfg.carrot_bonus} | "
           f"batch={cfg.batch_size} | lr={cfg.lr} | "
@@ -853,8 +895,7 @@ def train_one_level(
         env.set_map(map_kind=map_kind, map_number=level)
         env.reset()
         grid, inv = _semantic_channels(env)
-
-        done     = False; steps = 0; ep_r = 0.0
+        done      = False; steps = 0; ep_r = 0.0
         info: Dict[str, object] = {}
         prev_inv = inv.copy()
         visit_counts = np.zeros(GRID_SIZE * GRID_SIZE, dtype=np.int16)
@@ -862,8 +903,13 @@ def train_one_level(
             sx, sy = env.bobby.coord_src
             visit_counts[sx + sy * GRID_SIZE] = 1
 
-        # FIX 3: track stall internally in the training loop
-        last_collected = 0; stall_counter = 0
+        # ── Stall detection: reset on new tile OR new carrot ──────────────────
+        # OLD code only reset on carrot collection → agent trapped after center
+        # carrots but before discovering crumble bridges.
+        # NEW: reset also on any new tile visited (exploring new area).
+        last_total_collected = 0
+        last_visited_count   = len(env._visited_tiles)
+        stall_counter        = 0
 
         while not done and steps < max_steps:
             if episode <= cfg.warmup_episodes:
@@ -880,30 +926,41 @@ def train_one_level(
 
             shaped = _shape_reward(info, cfg, level_cfg, prev_inv, next_inv, env, visit_counts)
 
-            # FIX 3: stall termination — end episode if no carrot collected for stall_steps
-            now_col = 0
+            # ── Stall termination ─────────────────────────────────────────────
+            now_col     = 0
+            now_visited = len(env._visited_tiles)
             if env.bobby is not None:
                 now_col = env.bobby.carrot_count + env.bobby.egg_count
-            if now_col > last_collected:
-                last_collected = now_col; stall_counter = 0
+            # Reset stall if: collected new carrot OR visited new tile
+            if now_col > last_total_collected or now_visited > last_visited_count:
+                last_total_collected = now_col
+                last_visited_count   = now_visited
+                stall_counter        = 0
             else:
                 stall_counter += 1
-            if not done and stall_counter >= cfg.stall_steps:
-                done = True; info["stall_terminated"] = True
+
+            if not done and stall_counter >= stall_steps:
+                done = True
+                info["stall_terminated"] = True
 
             # Terminal failure penalty
             if done and not info.get("level_completed"):
                 if env.bobby is not None and env.map_info is not None:
                     total   = env.map_info.carrot_total + env.map_info.egg_total
                     done_n  = env.bobby.carrot_count + env.bobby.egg_count
-                    rem_frac= 1.0 - float(done_n) / float(max(1, total))
+                    rem_frac = 1.0 - float(done_n) / float(max(1, total))
                     if rem_frac > 0:
                         shaped += cfg.incomplete_penalty * rem_frac
 
             agent.replay.push(grid, inv, action, shaped, next_grid, next_inv, done)
 
-            n_os = (cfg.terminal_oversample   if info.get("level_completed") else
-                    cfg.all_collected_oversample if (info.get("all_collected") and not info.get("level_completed")) else 0)
+            # Oversample important transitions
+            n_os = (cfg.terminal_oversample
+                    if info.get("level_completed") else
+                    cfg.all_collected_oversample
+                    if (info.get("all_collected") and not info.get("level_completed")) else
+                    # Also oversample crumble-area reward transitions (key signal)
+                    3 if int(info.get("newly_reachable", 0)) > 0 else 0)
             for _ in range(n_os):
                 agent.replay.push(grid, inv, action, shaped, next_grid, next_inv, done)
 
@@ -916,15 +973,11 @@ def train_one_level(
 
         agent.decay_epsilon()
 
-        # FIX 3: pre_success_eps_floor=0.0 means epsilon can freely decay
-        if cfg.pre_success_eps_floor > 0 and not ever_succeeded:
-            agent.epsilon = max(agent.epsilon, cfg.pre_success_eps_floor)
-
         success   = 1.0 if info.get("level_completed") else 0.0
         if success > 0: ever_succeeded = True
         collected = 1.0 if info.get("all_collected") else 0.0
         total_col = (env.map_info.carrot_total + env.map_info.egg_total) if env.map_info else 1
-        done_col  = (env.bobby.carrot_count + env.bobby.egg_count) if env.bobby else 0
+        done_col  = (env.bobby.carrot_count + env.bobby.egg_count)       if env.bobby   else 0
         progress  = float(done_col) / float(max(1, total_col))
         if progress > best_progress: best_progress = progress
 
@@ -932,12 +985,12 @@ def train_one_level(
         collected_hist.append(collected); progress_hist.append(progress)
 
         if episode % cfg.report_every == 0 or episode == 1:
-            n       = cfg.report_every
-            avg_r   = float(np.mean(reward_hist[-n:]))
-            avg_s   = float(np.mean(success_hist[-n:]))
-            avg_c   = float(np.mean(collected_hist[-n:]))
-            avg_p   = float(np.mean(progress_hist[-n:]))
-            avg_l   = float(np.mean(loss_win)) if loss_win else 0.0
+            n     = cfg.report_every
+            avg_r = float(np.mean(reward_hist[-n:]))
+            avg_s = float(np.mean(success_hist[-n:]))
+            avg_c = float(np.mean(collected_hist[-n:]))
+            avg_p = float(np.mean(progress_hist[-n:]))
+            avg_l = float(np.mean(loss_win)) if loss_win else 0.0
             elapsed = time.time() - t0
             sps     = total_env_steps / max(elapsed, 1e-6)
             eta_h   = ((n_episodes - episode) * max_steps) / max(sps, 1) / 3600
@@ -949,7 +1002,8 @@ def train_one_level(
             if avg_s == 0.0 and avg_p < 0.05 and episode >= 4 * cfg.report_every:
                 stagnation_ctr += 1
                 if stagnation_ctr >= 4:
-                    old = agent.epsilon; agent.epsilon = max(agent.epsilon, 0.80)
+                    old = agent.epsilon
+                    agent.epsilon = max(agent.epsilon, 0.80)
                     print(f"[L{level}] Stagnation rescue: eps {old:.3f} → {agent.epsilon:.3f}")
                     stagnation_ctr = 0
             else:
@@ -1001,7 +1055,6 @@ def play_trained_dqn(
     level_cfg = _get_level_cfg(map_number)
     max_steps = level_cfg["max_steps"]
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     silent_rc = RewardConfig(
         step=0.0, carrot=0.0, egg=0.0, finish=0.0, death=0.0,
         invalid_move=0.0, distance_delta_scale=0.0,
@@ -1028,8 +1081,8 @@ def play_trained_dqn(
         proxy.bobby             = full_env.bobby
         proxy._expected_carrots = full_env.map_info.carrot_total if full_env.map_info else 0
         proxy._expected_eggs    = full_env.map_info.egg_total    if full_env.map_info else 0
+        proxy._visited_tiles    = set()
         grid, inv = _semantic_channels(proxy)
-
         done = False; steps = 0; total_r = 0.0
         info: Dict[str, object] = {}
         while not done and steps < max_steps:
@@ -1040,7 +1093,6 @@ def play_trained_dqn(
             if render:
                 full_env.render()
                 if render_fps > 0: time.sleep(1.0 / render_fps)
-
         print(f"Play ep {ep}/{episodes} | collected={bool(info.get('all_collected'))} | "
               f"success={bool(info.get('level_completed'))} | steps={steps}")
     full_env.close()
@@ -1060,19 +1112,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--episodes-per-level",   type=int,   default=None)
     p.add_argument("--max-steps",            type=int,   default=None)
     p.add_argument("--batch-size",           type=int,   default=256)
-    p.add_argument("--lr",                   type=float, default=5e-4)
+    p.add_argument("--lr",                   type=float, default=3e-4)
     p.add_argument("--gamma",                type=float, default=0.99)
     p.add_argument("--epsilon-start",        type=float, default=1.0)
     p.add_argument("--epsilon-min",          type=float, default=0.03)
-    p.add_argument("--epsilon-decay",        type=float, default=0.9994)
+    p.add_argument("--epsilon-decay",        type=float, default=0.9997)
     p.add_argument("--completion-bonus",     type=float, default=500.0)
     p.add_argument("--death-penalty",        type=float, default=-150.0)
     p.add_argument("--carrot-bonus",         type=float, default=30.0)
     p.add_argument("--egg-bonus",            type=float, default=30.0)
     p.add_argument("--all-collected-bonus",  type=float, default=100.0)
+    p.add_argument("--crumble-area-bonus",   type=float, default=25.0)
     p.add_argument("--reachability-loss-penalty", type=float, default=-80.0)
     p.add_argument("--incomplete-penalty",   type=float, default=-30.0)
-    p.add_argument("--crumble-penalty",      type=float, default=-1.0)
     p.add_argument("--invalid-move-penalty", type=float, default=-0.1)
     p.add_argument("--step-penalty",         type=float, default=-0.01)
     p.add_argument("--revisit-penalty",      type=float, default=-0.03)
@@ -1080,7 +1132,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--terminal-oversample",  type=int,   default=20)
     p.add_argument("--all-collected-oversample", type=int, default=5)
     p.add_argument("--warmup-episodes",      type=int,   default=10)
-    p.add_argument("--stall-steps",          type=int,   default=200)
+    p.add_argument("--stall-steps",          type=int,   default=None,
+                   help="Stall threshold (default: per-level config)")
     p.add_argument("--train-every",          type=int,   default=2)
     p.add_argument("--report-every",         type=int,   default=100)
     p.add_argument("--seed",                 type=int,   default=42)
@@ -1107,15 +1160,16 @@ def _cfg_from_args(args: argparse.Namespace) -> DQNConfig:
         completion_bonus=args.completion_bonus, death_penalty=args.death_penalty,
         carrot_bonus=args.carrot_bonus, egg_bonus=args.egg_bonus,
         all_collected_bonus=args.all_collected_bonus,
+        crumble_area_bonus=args.crumble_area_bonus,
         reachability_loss_penalty=args.reachability_loss_penalty,
         incomplete_penalty=args.incomplete_penalty,
-        crumble_penalty=args.crumble_penalty,
         invalid_move_penalty=args.invalid_move_penalty,
         step_penalty=args.step_penalty, revisit_penalty=args.revisit_penalty,
         new_tile_bonus=args.new_tile_bonus,
         terminal_oversample=args.terminal_oversample,
         all_collected_oversample=args.all_collected_oversample,
-        warmup_episodes=args.warmup_episodes, stall_steps=args.stall_steps,
+        warmup_episodes=args.warmup_episodes,
+        stall_steps=args.stall_steps if args.stall_steps is not None else 200,
         train_every_steps=args.train_every,
         report_every=args.report_every, seed=args.seed, use_amp=not args.no_amp,
     )
@@ -1126,6 +1180,8 @@ def _apply_cli_overrides(level: int, args: argparse.Namespace) -> None:
         LEVEL_CONFIG.setdefault(level, {})["episodes"] = args.episodes_per_level
     if args.max_steps is not None:
         LEVEL_CONFIG.setdefault(level, {})["max_steps"] = args.max_steps
+    if args.stall_steps is not None:
+        LEVEL_CONFIG.setdefault(level, {})["stall_steps"] = args.stall_steps
 
 
 def _main() -> None:
