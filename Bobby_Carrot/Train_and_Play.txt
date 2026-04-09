@@ -1,28 +1,25 @@
-1)  
-
-Training Level 4
+==================    Training Template    ==================
 
 python train_dqn.py \
-  --levels 4 \
-  --map-kind normal \
-  --episodes-per-level 4000 \
-  --max-steps 900 \
-  --epsilon-decay 0.997 \
-  --batch-size 256 \
+  --levels 7 \
   --lr 3e-4 \
-  --report-every 100
-
-Playing Level 4
-
-python train_dqn.py --play --map-kind normal --map-number 4 \
-  --model-path dqn_checkpoints/dqn_level4_sequential_best.pt \
-  --no-render \
-  --play-episodes 20
+  --report-every 100 \
+  --no-render
 
 
-Resuming Training (From Best Checkpoint)
+==================    Playing Template    ==================
 
-If training stops or disconnects, you can resume from exactly where you left off (maintaining episode count, optimizer state, and epsilon) using the --resume flag and pointing to your best checkpoint.
+python train_dqn.py --play --map-kind normal --map-number 7 `
+  --model-path L7_Outputs/dqn_bobby.pt `
+  --play-episodes 3
+
+
+
+==================    Resuming Training (From Best Checkpoint)    ==================
+
+If training stops or disconnects, you can resume from exactly where you left off 
+(maintaining episode count, optimizer state, and epsilon) 
+using the --resume flag and pointing to your best checkpoint.
 
 python train_dqn.py \
   --levels 7 \
