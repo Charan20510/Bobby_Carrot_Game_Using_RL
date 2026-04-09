@@ -19,3 +19,18 @@ python train_dqn.py --play --map-kind normal --map-number 4 \
   --no-render \
   --play-episodes 20
 
+
+Resuming Training (From Best Checkpoint)
+
+If training stops or disconnects, you can resume from exactly where you left off (maintaining episode count, optimizer state, and epsilon) using the --resume flag and pointing to your best checkpoint.
+
+python train_dqn.py \
+  --levels 7 \
+  --episodes-per-level 10000 \
+  --lr 3e-4 \
+  --report-every 100 \
+  --no-render \
+  --resume \
+  --model-path dqn_checkpoints/dqn_level7_sequential_best.pt
+
+Note: Adjust the --levels, --episodes-per-level, and --model-path depending on the level you are currently training.
