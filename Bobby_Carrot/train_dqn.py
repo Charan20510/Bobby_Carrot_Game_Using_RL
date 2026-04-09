@@ -738,6 +738,7 @@ class DQNAgent:
         self.device      = device
         self.epsilon     = cfg.epsilon_start
         self.total_steps = 0
+        self.current_episode = 0
         self.policy_net = DuelingDQNCNN(n_actions).to(device)
         self.target_net = DuelingDQNCNN(n_actions).to(device)
         self.target_net.load_state_dict(self.policy_net.state_dict())
@@ -808,6 +809,7 @@ class DQNAgent:
             "policy": _sd(self.policy_net), "target": _sd(self.target_net),
             "optim": self.optimizer.state_dict(),
             "epsilon": self.epsilon, "total_steps": self.total_steps,
+            "current_episode": getattr(self, "current_episode", 0),
             "level": level, "map_kind": map_kind,
             "grid_channels": GRID_CHANNELS, "inv_features": INV_FEATURES,
         }, path)
@@ -820,6 +822,7 @@ class DQNAgent:
         if "optim" in ckpt: self.optimizer.load_state_dict(ckpt["optim"])
         self.epsilon     = float(ckpt.get("epsilon",     self.cfg.epsilon_start))
         self.total_steps = int  (ckpt.get("total_steps", 0))
+        self.current_episode = int(ckpt.get("current_episode", 0))
         return {"level": ckpt.get("level", -1), "map_kind": ckpt.get("map_kind", "normal")}
 
 
@@ -890,8 +893,11 @@ def train_one_level(
           f"train_every={cfg.train_every_steps} | amp={cfg.use_amp}")
 
     t0 = time.time(); total_env_steps = 0
+    start_episode = agent.current_episode + 1
+    end_episode = start_episode + n_episodes
 
-    for episode in range(1, n_episodes + 1):
+    for episode in range(start_episode, end_episode):
+        agent.current_episode = episode
         env.set_map(map_kind=map_kind, map_number=level)
         env.reset()
         grid, inv = _semantic_channels(env)
@@ -912,7 +918,7 @@ def train_one_level(
         stall_counter        = 0
 
         while not done and steps < max_steps:
-            if episode <= cfg.warmup_episodes:
+            if episode <= cfg.warmup_episodes and agent.total_steps == 0:
                 action = random.randint(0, agent.n_actions - 1)
             else:
                 action = agent.select_action(grid, inv)
@@ -993,7 +999,7 @@ def train_one_level(
             avg_l = float(np.mean(loss_win)) if loss_win else 0.0
             elapsed = time.time() - t0
             sps     = total_env_steps / max(elapsed, 1e-6)
-            eta_h   = ((n_episodes - episode) * max_steps) / max(sps, 1) / 3600
+            eta_h   = ((end_episode - episode) * max_steps) / max(sps, 1) / 3600
             print(f"[L{level}] ep={episode:5d} | reward={avg_r:8.1f} | "
                   f"progress={avg_p:5.1%} | collected={avg_c:5.1%} | success={avg_s:5.1%} | "
                   f"eps={agent.epsilon:.3f} | loss={avg_l:.4f} | sps={sps:6.0f} | ETA={eta_h:.1f}h")
