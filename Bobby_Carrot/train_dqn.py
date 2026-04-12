@@ -143,6 +143,17 @@ def _bfs_numpy(md: np.ndarray, start: int) -> np.ndarray:
     return dist
 
 
+def _bfs_no_crumble(md: np.ndarray, start: int) -> np.ndarray:
+    """BFS treating crumble tiles (30) as walls.
+    Finds targets reachable in the CURRENT section without crossing
+    any crumble tile boundary. This guides the agent to collect all
+    targets in one section before moving to the next.
+    """
+    md_safe = md.copy()
+    md_safe[md_safe == 30] = 0  # crumble → impassable
+    return _bfs_numpy(md_safe, start)
+
+
 def _count_reachable(bfs: np.ndarray, md: np.ndarray) -> int:
     """Count remaining targets (carrots + eggs) reachable from agent via BFS."""
     target_mask = (md == 19) | (md == 45)
@@ -180,6 +191,8 @@ class BobbyEnv:
         self._visited    = np.zeros(256, dtype=np.float32)
         self._bfs: Optional[np.ndarray] = None
         self._bfs_dirty  = True
+        self._bfs_safe: Optional[np.ndarray] = None
+        self._bfs_safe_dirty = True
         # S2: observation cache
         self._obs_dirty  = True
         self._cached_grid: Optional[np.ndarray] = None
@@ -219,6 +232,8 @@ class BobbyEnv:
         self._visited[px + py * 16] = 1.0
         self._bfs_dirty  = True
         self._bfs        = None
+        self._bfs_safe_dirty = True
+        self._bfs_safe   = None
         self._obs_dirty  = True
         self._cached_grid = None
         self._cached_inv  = None
@@ -243,13 +258,23 @@ class BobbyEnv:
         return _can_move_tile(t_f, t_t, delta)
 
     def _bfs_to_nearest(self, bfs: Optional[np.ndarray] = None) -> int:
-        """Min BFS distance to nearest remaining target (or finish if all done)."""
+        """Min BFS distance to nearest remaining target (or finish if all done).
+        PREFERS targets reachable without crossing crumble tiles (current section).
+        Falls back to normal BFS if no targets exist in the current section.
+        """
         if bfs is None:
             bfs = self.get_bfs()
         all_done = self.n_collected == self.n_targets
         tmask = (self.md == 44) if all_done else ((self.md == 19) | (self.md == 45))
         if not tmask.any():
             return -1
+        # Prefer targets in current section (no crumble crossing)
+        bfs_safe = self.get_bfs_safe()
+        safe_dists = bfs_safe[tmask]
+        safe_valid = safe_dists[safe_dists >= 0]
+        if safe_valid.size:
+            return int(safe_valid.min())
+        # Fallback: must cross crumble to reach any target
         tdist = bfs[tmask]
         valid = tdist[tdist >= 0]
         return int(valid.min()) if valid.size else -1
@@ -324,12 +349,15 @@ class BobbyEnv:
 
         # R1: BFS is ALWAYS dirty after a valid move (position changed)
         self._bfs_dirty = True
+        self._bfs_safe_dirty = True
 
-        # ── New tile exploration bonus ────────────────────────────────────
+        # ── New tile exploration bonus / revisit penalty ──────────────────
         new_tile = self._visited[to_idx] == 0.0
         if new_tile:
             self._visited[to_idx] = 1.0
             reward += 0.1
+        else:
+            reward -= 0.05   # discourage revisiting already-explored tiles
 
         self.step_count += 1
         self._obs_dirty = True
@@ -368,11 +396,11 @@ class BobbyEnv:
             if exit_mask.any() and not np.any(bfs[exit_mask] >= 0):
                 return reward - 30.0, True, False  # exit unreachable
 
-        # ── R3: BFS distance shaping ──────────────────────────────────────
+        # ── R3: BFS distance shaping (stronger) ──────────────────────────
         bfs_to = self._bfs_to_nearest(bfs)
         if bfs_to >= 0 and self._prev_bfs_dist >= 0 and not collected:
             delta_d = self._prev_bfs_dist - bfs_to
-            reward += 0.05 * delta_d
+            reward += 0.15 * delta_d  # strong directional guidance
         self._prev_bfs_dist = bfs_to
 
         # ── R7: Stall detection ───────────────────────────────────────────
@@ -391,6 +419,14 @@ class BobbyEnv:
             self._bfs = _bfs_numpy(self.md, px + py * 16)
             self._bfs_dirty = False
         return self._bfs
+
+    def get_bfs_safe(self) -> np.ndarray:
+        """BFS treating crumble tiles as walls — for current-section navigation."""
+        if self._bfs_safe_dirty or self._bfs_safe is None:
+            px, py = self.pos
+            self._bfs_safe = _bfs_no_crumble(self.md, px + py * 16)
+            self._bfs_safe_dirty = False
+        return self._bfs_safe
 
     def get_obs(self) -> Tuple[np.ndarray, np.ndarray]:
         """S2: Cached; R6: 12-channel grid."""
@@ -412,19 +448,31 @@ class BobbyEnv:
             grid[4] = 0.0
 
         # BFS navigation heatmap in channel 9 (replaces key/switch semantic)
+        # CRUMBLE-AWARE: prefer targets in current section (no crumble crossing).
+        # This teaches the agent to clear one section before moving to the next.
         bfs = self.get_bfs()
+        bfs_safe = self.get_bfs_safe()
         all_done = self.n_collected == self.n_targets
         tmask = (md == 44) if all_done else ((md == 19) | (md == 45))
-        bfs_to_target = 32
-        if tmask.any():
-            tdist = bfs[tmask]
-            valid = tdist[tdist >= 0]
-            if valid.size:
-                bfs_to_target = int(valid.min())
-        reachable = bfs >= 0
+
+        # Choose which BFS to use for gradient: safe first, fallback to normal
+        safe_reachable = tmask & (bfs_safe >= 0)
+        if safe_reachable.any():
+            bfs_for_grad = bfs_safe   # guide within current section
+            bfs_to_target = int(bfs_safe[safe_reachable].min())
+        else:
+            bfs_for_grad = bfs        # must cross crumble
+            bfs_to_target = 32
+            if tmask.any():
+                tdist = bfs[tmask]
+                valid = tdist[tdist >= 0]
+                if valid.size:
+                    bfs_to_target = int(valid.min())
+
+        reachable = bfs_for_grad >= 0
         if reachable.any():
-            max_d = max(1, int(bfs[reachable].max()))
-            grad  = np.where(reachable, 1.0 - bfs.astype(np.float32) / max_d, 0.0)
+            max_d = max(1, int(bfs_for_grad[reachable].max()))
+            grad  = np.where(reachable, 1.0 - bfs_for_grad.astype(np.float32) / max_d, 0.0)
         else:
             grad  = np.zeros(256, dtype=np.float32)
         grid[9] = grad.reshape(16, 16)
@@ -504,12 +552,15 @@ class ReplayBuffer:
         self._ng = torch.zeros((cap, GRID_CHANNELS, 16, 16), dtype=torch.float16, **pin)
         self._nv = torch.zeros((cap, INV_FEATURES),          dtype=torch.float32, **pin)
         self._d  = torch.zeros(cap,                          dtype=torch.float32, **pin)
+        self._t  = torch.zeros(cap,                          dtype=torch.int64,   **pin)
+        self._tm = torch.zeros(cap,                          dtype=torch.float32, **pin)
 
     def __len__(self) -> int:
         return self._size
 
     def push(self, sg: np.ndarray, sv: np.ndarray, a: int, r: float,
-             ng: np.ndarray, nv: np.ndarray, done: bool) -> None:
+             ng: np.ndarray, nv: np.ndarray, done: bool,
+             teacher: Optional[int] = None) -> None:
         i   = self._ptr
         r   = float(np.clip(r, -60.0, 60.0))
         self._sg[i] = torch.from_numpy(sg).to(torch.float16)
@@ -519,6 +570,8 @@ class ReplayBuffer:
         self._ng[i] = torch.from_numpy(ng).to(torch.float16)
         self._nv[i] = torch.from_numpy(nv)
         self._d[i]  = float(done)
+        self._t[i]  = int(teacher if teacher is not None else 0)
+        self._tm[i] = 1.0 if teacher is not None else 0.0
         self._ptr   = (i + 1) % self._cap
         self._size  = min(self._size + 1, self._cap)
 
@@ -547,6 +600,8 @@ class ReplayBuffer:
             self._ng[idx].float().to(device, **nb),
             self._nv[idx]        .to(device, **nb),
             self._d[idx]         .to(device, **nb),
+            self._t[idx]         .to(device, **nb),
+            self._tm[idx]        .to(device, **nb),
         )
 
 
@@ -554,10 +609,11 @@ class ReplayBuffer:
 class DQNAgent:
     def __init__(self, device: torch.device, lr: float = 3e-4,
                  gamma: float = 0.99, batch_size: int = 512,
-                 target_update: int = 500) -> None:
+                 target_update: int = 500, teacher_weight: float = 0.25) -> None:
         self.device      = device
         self.gamma       = gamma
         self.batch_size  = batch_size
+        self.teacher_weight = teacher_weight
         self.epsilon     = 1.0
         self.total_steps = 0
         self.policy      = DuelingDQN().to(device)
@@ -583,15 +639,21 @@ class DQNAgent:
     def update(self) -> Optional[float]:
         if len(self.replay) < self.batch_size:
             return None
-        sg, sv, a, r, ng, nv, d = self.replay.sample(self.batch_size, self.device)
+        sg, sv, a, r, ng, nv, d, t, tm = self.replay.sample(self.batch_size, self.device)
 
         def _loss() -> torch.Tensor:
-            qp = self.policy(sg, sv).gather(1, a).squeeze(1)
+            q_all = self.policy(sg, sv)
+            qp = q_all.gather(1, a).squeeze(1)
             with torch.no_grad():
                 best_a = self.policy(ng, nv).argmax(1, keepdim=True)
                 qn     = self.target(ng, nv).gather(1, best_a).squeeze(1)
                 tgt    = (r + (1.0 - d) * self.gamma * qn).clamp(-70.0, 120.0)
-            return F.smooth_l1_loss(qp, tgt)
+            td_loss = F.smooth_l1_loss(qp, tgt)
+            if float(tm.sum().item()) > 0.0:
+                teacher_loss = F.cross_entropy(q_all, t, reduction="none")
+                teacher_loss = (teacher_loss * tm).sum() / tm.sum().clamp_min(1.0)
+                return td_loss + self.teacher_weight * teacher_loss
+            return td_loss
 
         if self.use_amp:
             with torch.amp.autocast("cuda"):
@@ -663,6 +725,65 @@ def _parse_levels(s: str) -> List[int]:
         else:
             levels.append(int(part))
     return sorted(set(levels))
+
+
+def _bfs_teacher_action(env: BobbyEnv) -> Optional[int]:
+    """Return a BFS-guided action when a reachable target exists.
+
+    Returns None when no target is reachable from the current state.
+    """
+    bfs = env.get_bfs()
+    bfs_safe = env.get_bfs_safe()
+    px, py = env.pos
+
+    all_done = env.n_collected == env.n_targets
+    tmask = (env.md == 44) if all_done else ((env.md == 19) | (env.md == 45))
+    if not tmask.any():
+        return None
+
+    safe_reachable = tmask & (bfs_safe >= 0)
+    if safe_reachable.any():
+        use_bfs = bfs_safe
+    else:
+        normal_reachable = tmask & (bfs >= 0)
+        if not normal_reachable.any():
+            return None
+        use_bfs = bfs
+
+    best_action: Optional[int] = None
+    best_dist: Optional[int] = None
+    for action, (dx, dy) in enumerate(BobbyEnv.ACTION_DELTA):
+        if not env._can_move(px, py, dx, dy):
+            continue
+        nx, ny = px + dx, py + dy
+        dist = int(use_bfs[nx + ny * 16])
+        if dist < 0:
+            continue
+        if best_dist is None or dist < best_dist:
+            best_dist = dist
+            best_action = action
+
+    return best_action
+
+
+def _bfs_best_action(env: BobbyEnv) -> int:
+    """Pick the action that moves the agent one step closer to the nearest target.
+    Uses crumble-aware BFS (collects current section first).
+    Falls back to random if no clear path exists.
+    Fully generic — works on any map, no hardcoding.
+    """
+    teacher_action = _bfs_teacher_action(env)
+    if teacher_action is not None:
+        return teacher_action
+
+    # Fallback: random valid action
+    px, py = env.pos
+    valid_actions = [
+        action
+        for action, (dx, dy) in enumerate(BobbyEnv.ACTION_DELTA)
+        if env._can_move(px, py, dx, dy)
+    ]
+    return random.choice(valid_actions) if valid_actions else random.randint(0, N_ACTIONS - 1)
 
 
 # ── Training loop ──────────────────────────────────────────────────────────────
@@ -751,6 +872,7 @@ def train(
     env_steps  = 0
     best_sr    = 0.0
     early_win  = 0
+    stag_count = 0          # stagnation detector: 0% success + high collection
     t0         = time.time()
     target_eps = total_eps + n_episodes
 
@@ -769,15 +891,30 @@ def train(
         for i, env in enumerate(envs):
             g, v   = env.get_obs()
 
-            # Warmup: pure random for first warmup_eps completed episodes
+            # BFS-guided exploration: during warmup and epsilon-random,
+            # 50% actions follow BFS pathfinding toward nearest target.
+            # This gives the replay buffer good trajectories to learn from
+            # while maintaining exploration randomness.
             if total_eps < warmup_eps:
-                action = random.randint(0, N_ACTIONS - 1)
+                # Warmup: mostly BFS-guided (70%) to seed replay with useful data
+                if random.random() < 0.7:
+                    action = _bfs_best_action(env)
+                else:
+                    action = random.randint(0, N_ACTIONS - 1)
+            elif random.random() < agent.epsilon:
+                # Epsilon exploration: 50% BFS-guided, 50% random
+                if random.random() < 0.5:
+                    action = _bfs_best_action(env)
+                else:
+                    action = random.randint(0, N_ACTIONS - 1)
             else:
+                # Exploitation: use policy network
                 action = agent.act(g, v)
 
+            teacher_action = _bfs_teacher_action(env)
             r, done, won = env.step(action)
             ng, nv = env.get_obs()
-            agent.replay.push(g, v, action, r, ng, nv, done)
+            agent.replay.push(g, v, action, r, ng, nv, done, teacher=teacher_action)
 
             if done:
                 cr = env.n_collected / max(1, env.n_targets)
@@ -836,6 +973,19 @@ def train(
                     return
             else:
                 early_win = 0
+
+            # ── Stagnation detection: high collection but zero success ────
+            # If the agent collects well but never finishes, it's stuck on a
+            # bad route. Temporarily boost epsilon to force path exploration.
+            if sr < 0.01 and cr > 0.60 and total_eps > warmup_eps + 200:
+                stag_count += 1
+                if stag_count >= 3:  # 3 consecutive reports with 0% success
+                    old_eps = agent.epsilon
+                    agent.epsilon = max(agent.epsilon, 0.30)
+                    print(f"  [!] Stagnation: eps {old_eps:.3f} -> {agent.epsilon:.3f}")
+                    stag_count = 0
+            else:
+                stag_count = 0
 
         if total_eps > 0 and total_eps % save_every == 0 and total_eps != last_save_ep:
             last_save_ep = total_eps
