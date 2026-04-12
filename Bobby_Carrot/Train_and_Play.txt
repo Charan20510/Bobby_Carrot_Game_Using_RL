@@ -36,6 +36,13 @@ python Bobby_Carrot/train_q_learning.py `
   --play-episodes 3
 
 
+
+==================    Playing Template (GUI)   ==================
+
+# Level 3
+python Bobby_Carrot/train_dqn.py --play-gui --level 3 --model-path "Bobby_Carrot/dqn_level3.pt"
+
+
 ==================    Resuming Training (From Best Checkpoint)    ==================
 
 If training stops or disconnects, you can resume from exactly where you left off 

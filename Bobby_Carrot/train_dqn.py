@@ -192,6 +192,12 @@ class BobbyEnv:
         self._stall_steps = 0
         self._stall_limit = 150
 
+    def set_level(self, level: int) -> None:
+        """Switch to a different level (for multi-level training). Call reset() after."""
+        self.map_number = level
+        self._map_obj = Map(self.map_kind, level)
+        self._fresh = None
+
     def _load_fresh(self) -> None:
         self._fresh = self._map_obj.load_map_info()
 
@@ -333,6 +339,12 @@ class BobbyEnv:
             self.finished = True
             return reward + 50.0, True, True
 
+        # ── All-targets-collected milestone bonus ─────────────────────────
+        # Fires when agent collects the LAST target but is NOT on the exit yet.
+        # Strongly incentivizes 100% collection before navigating to exit.
+        if collected and self.n_collected == self.n_targets:
+            reward += 10.0
+
         # ── R2: Reachability check ────────────────────────────────────────
         # Compute BFS from new position (forces recompute since _bfs_dirty)
         bfs = self.get_bfs()
@@ -344,10 +356,17 @@ class BobbyEnv:
             expected = self._prev_reachable - (1 if collected else 0)
             lost = max(0, expected - reachable)
             if lost > 0:
-                reward -= 3.0 * lost   # heavy penalty per lost target
+                reward -= 10.0 * lost  # heavy penalty per permanently lost target
             self._prev_reachable = reachable
+            # Catastrophic: targets remain but NONE are reachable (crumble blocked)
+            if reachable == 0:
+                return reward - 30.0, True, False
         else:
             self._prev_reachable = 0
+            # All targets collected — verify exit is still reachable
+            exit_mask = self.md == 44
+            if exit_mask.any() and not np.any(bfs[exit_mask] >= 0):
+                return reward - 30.0, True, False  # exit unreachable
 
         # ── R3: BFS distance shaping ──────────────────────────────────────
         bfs_to = self._bfs_to_nearest(bfs)
@@ -597,9 +616,10 @@ class DQNAgent:
             self.target.load_state_dict(self.policy.state_dict())
         return float(loss.item())
 
-    def save(self, path: Path, level: int, map_kind: str) -> None:
+    def save(self, path: Path, level: int, map_kind: str,
+             extra: Optional[Dict] = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
+        data = {
             "policy":      self.policy.state_dict(),
             "target":      self.target.state_dict(),
             "optim":       self.opt.state_dict(),
@@ -607,7 +627,10 @@ class DQNAgent:
             "total_steps": self.total_steps,
             "level":       level,
             "map_kind":    map_kind,
-        }, path)
+        }
+        if extra:
+            data.update(extra)
+        torch.save(data, path)
         print(f"  [saved] {path.name}")
 
     def load(self, path: Path) -> Dict:
@@ -621,15 +644,32 @@ class DQNAgent:
                 pass
         self.epsilon     = float(ck.get("epsilon",     1.0))
         self.total_steps = int(ck.get("total_steps",   0))
+        total_ep = int(ck.get("total_eps", 0))
         print(f"  [loaded] level={ck.get('level',-1)} "
-              f"eps={self.epsilon:.3f} steps={self.total_steps}")
-        return {"level": ck.get("level",-1), "map_kind": ck.get("map_kind","normal")}
+              f"eps={self.epsilon:.3f} steps={self.total_steps} ep={total_ep}")
+        return {"level": ck.get("level",-1), "map_kind": ck.get("map_kind","normal"),
+                "total_eps": total_ep, "best_sr": float(ck.get("best_sr", 0.0))}
+
+
+# ── Level parsing helper ──────────────────────────────────────────────────────
+def _parse_levels(s: str) -> List[int]:
+    """Parse level specification: '3-25', '3,5,7', or '4'."""
+    levels: List[int] = []
+    for part in s.split(','):
+        part = part.strip()
+        if '-' in part:
+            lo, hi = part.split('-', 1)
+            levels.extend(range(int(lo), int(hi) + 1))
+        else:
+            levels.append(int(part))
+    return sorted(set(levels))
 
 
 # ── Training loop ──────────────────────────────────────────────────────────────
 def train(
     map_kind:      str   = "normal",
     level:         int   = 9,
+    levels:        Optional[List[int]] = None,
     n_episodes:    int   = 4000,
     max_steps:     Optional[int] = None,
     lr:            float = 3e-4,
@@ -661,21 +701,35 @@ def train(
     print(f"Device: {device}"
           + (f" | {torch.cuda.get_device_name(0)}" if device.type == "cuda" else ""))
 
+    # Resolve level pool for single-level or multi-level training
+    level_pool = levels if levels and len(levels) > 0 else [level]
+    multi = len(level_pool) > 1
+
     ckpt = Path(ckpt_dir)
     ckpt.mkdir(parents=True, exist_ok=True)
     if not model_path:
-        model_path = str(ckpt / f"dqn_{map_kind}{level}.pt")
+        if multi:
+            model_path = str(ckpt / f"dqn_{map_kind}{min(level_pool)}_{max(level_pool)}.pt")
+        else:
+            model_path = str(ckpt / f"dqn_{map_kind}{level_pool[0]}.pt")
     out = Path(model_path)
 
     # Probe map for metadata
-    probe = BobbyEnv(map_kind, level, max_steps)
+    probe = BobbyEnv(map_kind, level_pool[0], max_steps)
     probe.reset()
     eff_max = probe.max_steps
-    print(f"Level {map_kind}-{level} | targets={probe.n_targets} "
-          f"| max_steps={eff_max} | n_envs={n_envs}")
+    if multi:
+        print(f"Multi-level training: {len(level_pool)} levels "
+              f"({min(level_pool)}-{max(level_pool)}) | n_envs={n_envs}")
+    else:
+        print(f"Level {map_kind}-{level_pool[0]} | targets={probe.n_targets} "
+              f"| max_steps={eff_max} | n_envs={n_envs}")
 
-    # S7: N_ENVS parallel environments
-    envs = [BobbyEnv(map_kind, level, max_steps) for _ in range(n_envs)]
+    # S7: N_ENVS parallel environments (each on a random level from pool)
+    envs: List[BobbyEnv] = []
+    for _ in range(n_envs):
+        lvl = random.choice(level_pool)
+        envs.append(BobbyEnv(map_kind, lvl, max_steps))
     for e in envs:
         e.reset()
 
@@ -683,29 +737,34 @@ def train(
                      batch_size=batch_size, target_update=target_update)
     agent.epsilon = eps_start
 
+    start_eps = 0
     if resume and out.exists():
-        agent.load(out)
+        ck_info = agent.load(out)
+        start_eps = ck_info.get("total_eps", 0)
 
     # Metrics
     completed_cr:  List[float] = []
     completed_win: List[float] = []
     losses_buf:    List[float] = []
 
-    total_eps  = 0
+    total_eps  = start_eps
     env_steps  = 0
     best_sr    = 0.0
     early_win  = 0
     t0         = time.time()
+    target_eps = total_eps + n_episodes
 
-    print(f"\n=== Training L{level} for {n_episodes} episodes ===")
-    print(f"eps: {eps_start:.2f} -> {eps_min:.2f} (decay={eps_decay}/ep, "
+    tag = f"L{min(level_pool)}-{max(level_pool)}" if multi else f"L{level_pool[0]}"
+    print(f"\n=== Training {tag} for {n_episodes} episodes "
+          f"(ep {total_eps}->{target_eps}) ===")
+    print(f"eps: {agent.epsilon:.2f} -> {eps_min:.2f} (decay={eps_decay}/ep, "
           f"~{int(-1/np.log(eps_decay))} eps to min) | "
           f"warmup={warmup_eps} | grad_every={grad_every} | batch={batch_size}")
 
     last_report_ep = -1
     last_save_ep   = -1
 
-    while total_eps < n_episodes:
+    while total_eps < target_eps:
         # ── Collect one step across all envs (S7) ────────────────────────
         for i, env in enumerate(envs):
             g, v   = env.get_obs()
@@ -730,6 +789,9 @@ def train(
                 if total_eps > warmup_eps:
                     agent.epsilon = max(eps_min, agent.epsilon * eps_decay)
 
+                # Multi-level: assign random level from pool on reset
+                if multi:
+                    env.set_level(random.choice(level_pool))
                 env.reset()
 
         env_steps += n_envs
@@ -752,30 +814,36 @@ def train(
             cr  = float(np.mean(completed_cr[-window:]))
             al  = float(np.mean(losses_buf[-200:])) if losses_buf else 0.0
             sps = env_steps / max(time.time() - t0, 1e-6)
-            eta = max(0.0, (n_episodes - total_eps) * eff_max / max(sps, 1) / 60)
-            print(f"[L{level}] ep={total_eps:5d}/{n_episodes} | "
+            eta = max(0.0, (target_eps - total_eps) * eff_max / max(sps, 1) / 60)
+            print(f"[{tag}] ep={total_eps:5d}/{target_eps} | "
                   f"collected={cr:5.1%} | success={sr:5.1%} | "
                   f"eps={agent.epsilon:.3f} | loss={al:.4f} | "
                   f"sps={sps:.0f} | ETA={eta:.1f}min")
 
             if sr > best_sr:
                 best_sr = sr
-                agent.save(ckpt / f"dqn_{map_kind}{level}_best.pt", level, map_kind)
+                best_name = (f"dqn_{map_kind}{min(level_pool)}_{max(level_pool)}_best.pt"
+                             if multi else f"dqn_{map_kind}{level_pool[0]}_best.pt")
+                agent.save(ckpt / best_name, level_pool[0], map_kind,
+                           extra={"total_eps": total_eps, "best_sr": best_sr})
 
             if sr >= target_sr and cr >= target_cr and total_eps >= 200:
                 early_win += 1
                 if early_win >= 3:
-                    print(f"[L{level}] Early stop: sr={sr:.1%} cr={cr:.1%}")
-                    agent.save(out, level, map_kind)
+                    print(f"[{tag}] Early stop: sr={sr:.1%} cr={cr:.1%}")
+                    agent.save(out, level_pool[0], map_kind,
+                               extra={"total_eps": total_eps, "best_sr": best_sr})
                     return
             else:
                 early_win = 0
 
         if total_eps > 0 and total_eps % save_every == 0 and total_eps != last_save_ep:
             last_save_ep = total_eps
-            agent.save(out, level, map_kind)
+            agent.save(out, level_pool[0], map_kind,
+                       extra={"total_eps": total_eps, "best_sr": best_sr})
 
-    agent.save(out, level, map_kind)
+    agent.save(out, level_pool[0], map_kind,
+               extra={"total_eps": total_eps, "best_sr": best_sr})
     if completed_win:
         window = min(100, len(completed_win))
         print(f"\nDone. Best success={best_sr:.1%} | "
@@ -787,6 +855,7 @@ def train(
 def play(
     map_kind:   str = "normal",
     level:      int = 9,
+    levels:     Optional[List[int]] = None,
     model_path: str = "",
     n_episodes: int = 20,
     ckpt_dir:   str = "dqn_checkpoints",
@@ -804,22 +873,35 @@ def play(
     agent.epsilon = 0.0
     agent.policy.eval()
 
-    env  = BobbyEnv(map_kind, level, max_steps)
-    wins = 0
-    for ep in range(1, n_episodes + 1):
-        env.reset()
-        g, v  = env.get_obs()
-        done  = False
-        steps = 0
-        while not done:
-            a = agent.act(g, v)
-            _, done, _ = env.step(a)
-            g, v = env.get_obs()
-            steps += 1
-        wins += int(env.finished)
-        print(f"Ep {ep:3d}: {'WIN ' if env.finished else 'FAIL'} | "
-              f"steps={steps:4d} | collected={env.n_collected}/{env.n_targets}")
-    print(f"\nSuccess rate: {wins}/{n_episodes} = {wins/n_episodes:.1%}")
+    eval_levels = levels if levels and len(levels) > 0 else [level]
+
+    all_wins  = 0
+    all_total = 0
+
+    for lvl in eval_levels:
+        env  = BobbyEnv(map_kind, lvl, max_steps)
+        wins = 0
+        if len(eval_levels) > 1:
+            print(f"\n--- Level {lvl} ---")
+        for ep in range(1, n_episodes + 1):
+            env.reset()
+            g, v  = env.get_obs()
+            done  = False
+            steps = 0
+            while not done:
+                a = agent.act(g, v)
+                _, done, _ = env.step(a)
+                g, v = env.get_obs()
+                steps += 1
+            wins += int(env.finished)
+            print(f"Ep {ep:3d}: {'WIN ' if env.finished else 'FAIL'} | "
+                  f"steps={steps:4d} | collected={env.n_collected}/{env.n_targets}")
+        print(f"Level {lvl} success: {wins}/{n_episodes} = {wins/n_episodes:.1%}")
+        all_wins  += wins
+        all_total += n_episodes
+
+    if len(eval_levels) > 1:
+        print(f"\nOverall success: {all_wins}/{all_total} = {all_wins/all_total:.1%}")
 
 
 # ── GUI Play with Pygame rendering ─────────────────────────────────────────────
@@ -1055,6 +1137,9 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Play with full Pygame GUI rendering (3 episodes)")
     p.add_argument("--map-kind",      default="normal", choices=["normal","egg"])
     p.add_argument("--level",         type=int,   default=9)
+    p.add_argument("--levels",        default="",
+                   help="Level range for multi-level training/testing "
+                        "(e.g., '3-25' or '3,5,7'). Overrides --level.")
     p.add_argument("--model-path",    default="")
     p.add_argument("--ckpt-dir",      default="dqn_checkpoints")
     p.add_argument("--episodes",      type=int,   default=4000)
@@ -1081,16 +1166,20 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    parsed_levels = _parse_levels(args.levels) if args.levels else None
+
     if args.play_gui:
         play_gui(map_kind=args.map_kind, level=args.level,
                  model_path=args.model_path, n_episodes=3,
                  ckpt_dir=args.ckpt_dir, max_steps=args.max_steps)
     elif args.play:
         play(map_kind=args.map_kind, level=args.level,
+             levels=parsed_levels,
              model_path=args.model_path, n_episodes=args.play_episodes,
              ckpt_dir=args.ckpt_dir, max_steps=args.max_steps)
     else:
         train(map_kind=args.map_kind, level=args.level,
+              levels=parsed_levels,
               n_episodes=args.episodes, max_steps=args.max_steps,
               lr=args.lr, batch_size=args.batch_size, gamma=args.gamma,
               eps_start=args.eps_start, eps_min=args.eps_min,

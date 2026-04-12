@@ -1,9 +1,18 @@
-# ⚡ QUICK START: L1-L25 Training + L26-L30 Testing
+# ⚡ QUICK START: Train L3-L25 (Multi-Level) + Test L26-L30
 
-## ✅ CODE STATUS
-**train_dqn.py: VERIFIED for L1-L30. NO ISSUES FOUND.**
+## ✅ TRAINING APPROACH
 
-All 30 normal maps exist and work correctly.
+**One model trained on levels 3-25 → test generalization on unseen levels 26-30.**
+
+- L1-L2: Trained separately with `train_q_learning.py` (tabular Q-learning)
+- L3-L25: Trained together with `train_dqn.py` using `--levels 3-25` (one DQN model)
+- L26-L30: **Never trained** — evaluation only with the L3-25 model
+
+### Key Design (No Hardcoding / No Memorization)
+- Observations: current tile types, BFS gradients, agent position, visited mask — all computed dynamically
+- Each episode picks a **random level** from the pool → model learns GENERIC navigation
+- No level number in observations → model can't memorize specific maps
+- BFS gradient guides toward nearest target regardless of map layout
 
 ---
 
@@ -17,177 +26,106 @@ All 30 normal maps exist and work correctly.
 %cd Bobby_Carrot_Game_using_RL
 !pip install torch pygame numpy -q
 import torch
-print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
 ```
 
 ```python
-# Cell 2: Mount Drive + Create folders
+# Cell 2: Mount Drive
 from google.colab import drive; drive.mount('/content/drive')
 import os
-for L in range(1, 31): 
-    os.makedirs(f"/content/drive/MyDrive/bobby_models/L{L}", exist_ok=True)
-print("✓ Folders created L1-L30")
+os.makedirs("/content/drive/MyDrive/bobby_models", exist_ok=True)
+print("✓ Drive mounted")
 ```
 
 ---
 
-## 📊 TRAINING – L1-L5 (Pattern repeats for L6-L10, L11-L15, etc.)
-
-### L1 – Train
+### STEP 2: Train L3-L25 (Multi-Level, Single Model)
 
 ```bash
 %cd /content/Bobby_Carrot_Game_using_RL
 !python Bobby_Carrot/train_dqn.py \
-  --level 1 --episodes 2000 --warmup-eps 30 --n-envs 8 \
-  --model-path "/content/drive/MyDrive/bobby_models/L1/dqn_level1.pt" \
-  --report-every 100 --save-every 500
+  --levels 3-25 \
+  --episodes 10000 \
+  --warmup-eps 80 \
+  --n-envs 8 \
+  --eps-decay 0.9995 \
+  --model-path "/content/drive/MyDrive/bobby_models/dqn_multi_3_25.pt" \
+  --report-every 200 --save-every 1000
 ```
 
-### L1 – Test (After training)
+**What this does:** Trains one model across ALL 23 levels. Each episode picks a random level. The model learns general strategies for crumble tiles, conveyors, arrows, keys, and switches.
 
+**Resume if Colab disconnects:**
 ```bash
-!python Bobby_Carrot/train_dqn.py --play --level 1 --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/L1/dqn_level1.pt"
-```
-
-### L2 through L5 – Same pattern (change `--level 2`, `--level 3`, etc.)
-
-```bash
-# L2
-!python Bobby_Carrot/train_dqn.py --level 2 --episodes 2000 --warmup-eps 30 --n-envs 8 \
-  --model-path "/content/drive/MyDrive/bobby_models/L2/dqn_level2.pt" \
-  --report-every 100 --save-every 500
-!python Bobby_Carrot/train_dqn.py --play --level 2 --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/L2/dqn_level2.pt"
-
-# L3
-!python Bobby_Carrot/train_dqn.py --level 3 --episodes 2000 --warmup-eps 30 --n-envs 8 \
-  --model-path "/content/drive/MyDrive/bobby_models/L3/dqn_level3.pt" \
-  --report-every 100 --save-every 500
-!python Bobby_Carrot/train_dqn.py --play --level 3 --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/L3/dqn_level3.pt"
-
-# L4, L5... (repeat)
-```
-
----
-
-## 🔄 BATCH TEMPLATE (Copy this, change level number)
-
-For **L6-L10, L11-L15, L16-L20, L21-L25**, use this template:
-
-```bash
-# Replace X with level number (6, 7, 8, ..., 25)
 !python Bobby_Carrot/train_dqn.py \
-  --level X --episodes 2000 --warmup-eps 30 --n-envs 8 \
-  --model-path "/content/drive/MyDrive/bobby_models/LX/dqn_levelX.pt" \
-  --report-every 100 --save-every 500
-
-# After training, play
-!python Bobby_Carrot/train_dqn.py --play --level X --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/LX/dqn_levelX.pt"
+  --levels 3-25 \
+  --episodes 5000 \
+  --warmup-eps 0 \
+  --n-envs 8 \
+  --eps-decay 0.9995 \
+  --model-path "/content/drive/MyDrive/bobby_models/dqn_multi_3_25.pt" \
+  --resume \
+  --report-every 200 --save-every 1000
 ```
 
 ---
 
-## 🧪 TESTING – L26-L30 (Unseen Levels)
-
-**⚠️ IMPORTANT: Do NOT train L26-L30. Only test with L25 model.**
+### STEP 3: Test L26-L30 (Unseen Levels)
 
 ```bash
-# Test L26 with L25 model
-!python Bobby_Carrot/train_dqn.py --play --level 26 --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/L25/dqn_level25.pt"
-
-# Test L27 with L25 model
-!python Bobby_Carrot/train_dqn.py --play --level 27 --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/L25/dqn_level25.pt"
-
-# Test L28 with L25 model
-!python Bobby_Carrot/train_dqn.py --play --level 28 --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/L25/dqn_level25.pt"
-
-# Test L29 with L25 model
-!python Bobby_Carrot/train_dqn.py --play --level 29 --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/L25/dqn_level25.pt"
-
-# Test L30 with L25 model
-!python Bobby_Carrot/train_dqn.py --play --level 30 --play-episodes 20 \
-  --model-path "/content/drive/MyDrive/bobby_models/L25/dqn_level25.pt"
+# Test on ALL unseen levels with one command
+!python Bobby_Carrot/train_dqn.py --play \
+  --levels 26-30 \
+  --play-episodes 20 \
+  --model-path "/content/drive/MyDrive/bobby_models/dqn_multi_3_25.pt"
 ```
 
----
-
-## 📋 SCHEDULE
-
-| Phase | Levels | Duration |
-|-------|--------|----------|
-| Batch 1 | L1-L5 | ~11 hrs |
-| Batch 2 | L6-L10 | ~11 hrs |
-| Batch 3 | L11-L15 | ~11 hrs |
-| Batch 4 | L16-L20 | ~11 hrs |
-| Batch 5 | L21-L25 | ~11 hrs |
-| Testing | L26-L30 | ~1 hr |
-| **TOTAL** | | **~56 hrs** |
-
-**Tip:** Run multiple notebooks in parallel to speed up.
-
----
-
-## ✅ VALIDATION AFTER EACH LEVEL
-
-After training + testing each level, check:
-- [ ] Success rate > 0% by episode 500
-- [ ] Loss is decreasing
-- [ ] Model saved to Google Drive
-- [ ] Play test completes without errors
-
----
-
-## ⚠️ CRITICAL RULES
-
-1. ❌ **DO NOT** train L26-L30 (test set only)
-2. ❌ **DO NOT** share models between level trains
-3. ✅ **DO** save to Google Drive
-4. ✅ **DO** use separate model file per level
-5. ✅ **DO** test L26-L30 with L25 model after training complete
-
----
-
-## 🚨 IF ISSUES OCCUR
-
-| Problem | Fix |
-|---------|-----|
-| Model not saving | Check Google Drive path exists |
-| OOM error | Reduce `--n-envs 8` to `--n-envs 4` |
-| Training too slow | Increase `--n-envs 8` to `--n-envs 16` |
-| Model won't load | Verify CUDA available: `torch.cuda.is_available()` |
+This evaluates the model on each of L26, L27, L28, L29, L30 (20 episodes each) and prints per-level + overall success rate.
 
 ---
 
 ## 📊 EXPECTED RESULTS
 
-| Level Group | Expected Success Rate |
-|--|--|
-| L1-L5 (Easy) | 60-90% |
-| L6-L10 (Easy-Med) | 50-80% |
-| L11-L15 (Medium) | 30-70% |
-| L16-L20 (Medium-Hard) | 20-60% |
-| L21-L25 (Hard) | 10-50% |
-| L26-L30 (Unseen, L25 model) | 5-40% |
+| Phase | Target | Expected |
+|-------|--------|----------|
+| Training (L3-25, 10K eps) | collected >90% | ✓ After ~5000 eps |
+| Training (L3-25, 10K eps) | success >40% | ✓ After ~8000 eps |
+| Testing (L26-30, unseen) | success >40% | ✓ With good multi-level training |
 
 ---
 
-## 🎯 STATUS
+## ⚠️ CRITICAL RULES
 
-✅ All levels 1-30 verified OK  
-✅ train_dqn.py ready for L1-L25 training  
-✅ L26-L30 test set verified  
-✅ Zero issues found  
-✅ **READY TO START**
+1. ✅ **DO** use `--levels 3-25` for multi-level training
+2. ✅ **DO** save to Google Drive (Colab is temporary)
+3. ❌ **DO NOT** train on L26-L30 (test set only)
+4. ❌ **DO NOT** train per-level models for generalization testing
 
 ---
 
-**Go to Colab, run Setup, then train L1-L25 sequentially.**
+## 🚨 IF TRAINING IS SLOW
 
-See COLAB_L1_L25_TRAINING.md and AUDIT_L1_L25_L26_L30.md for full details.
+```bash
+# Reduce environments if OOM
+--n-envs 4
+
+# Or increase for faster training
+--n-envs 16
+
+# Reduce batch size if GPU memory issues
+--batch-size 256
+```
+
+---
+
+## 🎯 WHAT CHANGED FROM PREVIOUS VERSION
+
+| Before | After |
+|--------|-------|
+| One model per level (25 models) | One model for ALL levels |
+| Model memorizes specific map | Model learns GENERIC strategies |
+| ~0% success on unseen levels | >40% expected on L26-30 |
+| Crumble tiles: weak penalty (-3) | Strong penalty (-10) + early termination |
+| No exit reachability check | Exits immediately if exit blocked |
+
+See [AUDIT_L1_L25_L26_L30.md](AUDIT_L1_L25_L26_L30.md) for technical details.
