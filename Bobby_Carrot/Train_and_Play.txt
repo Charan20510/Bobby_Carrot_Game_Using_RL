@@ -1,0 +1,54 @@
+==================    Training Template    ==================
+
+1)  
+python Bobby_Carrot/train_q_learning.py `
+  --map-kind normal `
+  --map-number 1 `
+  --episodes 5000 `
+  --no-curriculum `
+  --model-path "Bobby_Carrot/Game Outputs/L1_Outputs/q_table_level1.pkl"
+
+2)
+python Bobby_Carrot/train_q_learning.py `
+  --map-kind normal `
+  --map-number 2 `
+  --episodes 5000 `
+  --no-curriculum `
+  --model-path "Bobby_Carrot/Game Outputs/L2_Outputs/q_table_level2.pkl"
+
+
+==================    Playing Template    ==================
+
+1)  
+python Bobby_Carrot/train_q_learning.py `
+  --play `
+  --map-kind normal `
+  --map-number 1 `
+  --model-path "Bobby_Carrot/Game Outputs/L1_Outputs/q_table_level1.pkl" `
+  --play-episodes 3
+
+2)
+python Bobby_Carrot/train_q_learning.py `
+  --play `
+  --map-kind normal `
+  --map-number 2 `
+  --model-path "Bobby_Carrot/Game Outputs/L2_Outputs/q_table_level2.pkl" `
+  --play-episodes 3
+
+
+==================    Resuming Training (From Best Checkpoint)    ==================
+
+If training stops or disconnects, you can resume from exactly where you left off 
+(maintaining episode count, optimizer state, and epsilon) 
+using the --resume flag and pointing to your best checkpoint.
+
+python train_dqn.py \
+  --levels 7 \
+  --episodes-per-level 10000 \
+  --lr 3e-4 \
+  --report-every 100 \
+  --no-render \
+  --resume \
+  --model-path dqn_checkpoints/dqn_level7_sequential_best.pt
+
+Note: Adjust the --levels, --episodes-per-level, and --model-path depending on the level you are currently training.

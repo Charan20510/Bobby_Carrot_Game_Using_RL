@@ -173,4 +173,8 @@ poetry.toml
 # LSP config files
 pyrightconfig.json
 
+# RL model artifacts (too large for regular Git history)
+*.pt
+Bobby_Carrot/dqn_checkpoint/
+
 # End of https://www.toptal.com/developers/gitignore/api/python
