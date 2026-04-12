@@ -43,12 +43,96 @@ If training stops or disconnects, you can resume from exactly where you left off
 using the --resume flag and pointing to your best checkpoint.
 
 python train_dqn.py \
-  --levels 7 \
-  --episodes-per-level 10000 \
+  --level 7 \
+  --episodes 10000 \
   --lr 3e-4 \
   --report-every 100 \
-  --no-render \
   --resume \
-  --model-path dqn_checkpoints/dqn_level7_sequential_best.pt
+  --model-path dqn_checkpoints/dqn_level7_best.pt
 
-Note: Adjust the --levels, --episodes-per-level, and --model-path depending on the level you are currently training.
+Note: Adjust the --level and --model-path depending on the level you are currently training.
+
+==================    COLAB T4 TRAINING – LEVELS 3 TO 5    ==================
+
+These commands are optimized for Google Colab T4 GPU with separate level training.
+Each level trains independently (no model sharing across levels).
+
+# Setup (run once in Colab)
+!git clone https://github.com/YOUR_REPO/Bobby_Carrot_Game_using_RL.git
+%cd Bobby_Carrot_Game_using_RL
+!pip install torch pygame numpy -q
+from google.colab import drive; drive.mount('/content/drive')
+
+# Level 3 – Train (2000 episodes, ~1.5-2 hrs on T4)
+!python Bobby_Carrot/train_dqn.py \
+  --level 3 \
+  --episodes 2000 \
+  --warmup-eps 30 \
+  --n-envs 8 \
+  --model-path "/content/drive/MyDrive/bobby_models/L3/dqn_level3.pt" \
+  --report-every 100 \
+  --save-every 500
+
+# Level 3 – Resume (if interrupted)
+!python Bobby_Carrot/train_dqn.py \
+  --level 3 \
+  --episodes 2000 \
+  --warmup-eps 30 \
+  --n-envs 8 \
+  --resume \
+  --model-path "/content/drive/MyDrive/bobby_models/L3/dqn_level3.pt"
+
+# Level 3 – Play/Evaluate (20 test episodes)
+!python Bobby_Carrot/train_dqn.py \
+  --play \
+  --level 3 \
+  --play-episodes 20 \
+  --model-path "/content/drive/MyDrive/bobby_models/L3/dqn_level3.pt"
+
+---
+
+# Level 4 – Train (2000 episodes, ~1.5-2 hrs on T4)
+!python Bobby_Carrot/train_dqn.py \
+  --level 4 \
+  --episodes 2000 \
+  --warmup-eps 30 \
+  --n-envs 8 \
+  --model-path "/content/drive/MyDrive/bobby_models/L4/dqn_level4.pt" \
+  --report-every 100 \
+  --save-every 500
+
+# Level 4 – Play/Evaluate (20 test episodes)
+!python Bobby_Carrot/train_dqn.py \
+  --play \
+  --level 4 \
+  --play-episodes 20 \
+  --model-path "/content/drive/MyDrive/bobby_models/L4/dqn_level4.pt"
+
+---
+
+# Level 5 – Train (2000 episodes, ~1.5-2 hrs on T4)
+!python Bobby_Carrot/train_dqn.py \
+  --level 5 \
+  --episodes 2000 \
+  --warmup-eps 30 \
+  --n-envs 8 \
+  --model-path "/content/drive/MyDrive/bobby_models/L5/dqn_level5.pt" \
+  --report-every 100 \
+  --save-every 500
+
+# Level 5 – Play/Evaluate (20 test episodes)
+!python Bobby_Carrot/train_dqn.py \
+  --play \
+  --level 5 \
+  --play-episodes 20 \
+  --model-path "/content/drive/MyDrive/bobby_models/L5/dqn_level5.pt"
+
+==================    IMPORTANT RULES    ==================
+
+1. DO NOT modify train_dqn.py code during training.
+2. Each level uses a SEPARATE model file – no model sharing.
+3. Use --resume ONLY if training same level was interrupted.
+4. Save to Google Drive – Colab runtime can disconnect.
+5. Training times: ~2000 ep = 1.5-2 hrs; ~4000 ep = 3-4 hrs on T4.
+
+See COLAB_TRAINING_GUIDE.md and TRAIN_DQN_AUDIT.md for full details.
