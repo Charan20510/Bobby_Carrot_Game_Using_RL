@@ -42,6 +42,20 @@ python Bobby_Carrot/train_q_learning.py `
 # Level 3
 python Bobby_Carrot/train_dqn.py --play-gui --level 3 --model-path "Bobby_Carrot/dqn_level3.pt"
 
+==================    GUIDE   ==================
+
+# Training (same as before)
+python Bobby_Carrot/train_dqn.py --level 3 --episodes 2000
+
+# Evaluation (same as before)
+python Bobby_Carrot/train_dqn.py --play --level 3
+
+# GUI playback (same as before)
+python Bobby_Carrot/train_dqn.py --play-gui --level 3
+
+# Resume training (same as before)
+python Bobby_Carrot/train_dqn.py --level 7 --episodes 10000 --resume --model-path dqn_checkpoints/dqn_level7_best.pt
+
 
 ==================    Resuming Training (From Best Checkpoint)    ==================
 
