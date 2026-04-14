@@ -88,10 +88,8 @@ class DQNAgent:
         self.policy.reset_noise()
         g = torch.from_numpy(grid).unsqueeze(0).to(self.device, non_blocking=True)
         v = torch.from_numpy(inv).unsqueeze(0).to(self.device, non_blocking=True)
-        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-            torch.compiler.cudagraph_mark_step_begin()
         with torch.no_grad():
-            return int(self.policy(g, v).argmax(1).item())
+            return int(self._unwrapped_policy(g, v).argmax(1).item())
 
     def act_batch(self, grids: List[np.ndarray], invs: List[np.ndarray]
                   ) -> List[int]:
@@ -104,10 +102,8 @@ class DQNAgent:
         n = len(grids)
         g = torch.from_numpy(np.stack(grids)).to(self.device, non_blocking=True)
         v = torch.from_numpy(np.stack(invs)).to(self.device, non_blocking=True)
-        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-            torch.compiler.cudagraph_mark_step_begin()
         with torch.no_grad():
-            q_values = self.policy(g, v)  # (n, N_ACTIONS)
+            q_values = self._unwrapped_policy(g, v)  # (n, N_ACTIONS)
             best_actions = q_values.argmax(1).cpu().numpy()
         return [int(best_actions[i]) for i in range(n)]
 
@@ -124,23 +120,16 @@ class DQNAgent:
         self.target.reset_noise()
 
         def _loss() -> tuple:
-            # Mark the beginning of a step for CUDAGraphs
-            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                torch.compiler.cudagraph_mark_step_begin()
-
             with torch.no_grad():
-                # Double DQN: policy selects action, target evaluates.
-                # Performed FIRST so its CUDAGraph execution doesn't overwrite
-                # the training activations of the main policy pass (needed for .backward()).
-                best_a = self.policy(ng, nv).argmax(1, keepdim=True)
+                # Double DQN: evaluate target action using the UNWRAPPED policy.
+                # This guarantees the CUDAGraph tracked by torch.compile is NOT invoked here,
+                # physically preventing any intermediate memory overwrite errors.
+                best_a = self._unwrapped_policy(ng, nv).argmax(1, keepdim=True)
                 qn = self.target(ng, nv).gather(1, best_a).squeeze(1)
                 # N-step target: R_n + γⁿ × Q(s_{t+n})
                 tgt = (r + (1.0 - d) * self.replay.gamma_n * qn).clamp(-60.0, 60.0)
 
-            # Ensure the CUDAGraphs step is marked again before the training forward pass!
-            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-                torch.compiler.cudagraph_mark_step_begin()
-
+            # Main training pass uses the compiled CUDAGraph policy
             q_all = self.policy(sg, sv)
             qp = q_all.gather(1, a).squeeze(1)
 
