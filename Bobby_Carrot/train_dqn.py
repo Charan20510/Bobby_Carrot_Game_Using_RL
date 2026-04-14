@@ -42,7 +42,7 @@ if not _GAME_DIR.exists():
 if str(_GAME_DIR) not in sys.path:
     sys.path.insert(0, str(_GAME_DIR))
 
-from bobby_carrot.game import (  # noqa: E402
+from bobby_carrot.game import (  # type: ignore[missing-import] # noqa: E402
     Map, MapInfo, Bobby, State, Assets,
     VIEW_WIDTH, VIEW_HEIGHT, FRAMES, WIDTH_POINTS_DELTA, HEIGHT_POINTS_DELTA,
     VIEW_WIDTH_POINTS, VIEW_HEIGHT_POINTS, FRAMES_PER_STEP, WIDTH_POINTS,

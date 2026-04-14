@@ -13,6 +13,8 @@ random exploration, especially in maze-like environments.
 from __future__ import annotations
 
 import math
+from typing import cast
+
 
 try:
     import torch
@@ -27,7 +29,7 @@ from dqn_env import GRID_CHANNELS, INV_FEATURES, N_ACTIONS
 # ── NoisyLinear — learned exploration ─────────────────────────────────────────
 class NoisyLinear(nn.Module):
     """Factorised Gaussian NoisyNet layer.
-
+    
     Instead of fixed ε-greedy noise, this layer learns noise parameters
     (σ_w, σ_b) alongside the usual weights (μ_w, μ_b). The network decides
     WHERE and HOW MUCH to explore — e.g., exploring more at decision points
@@ -35,6 +37,13 @@ class NoisyLinear(nn.Module):
 
     Reference: Fortunato et al., "Noisy Networks for Exploration" (2018)
     """
+
+    epsilon_weight: torch.Tensor
+    epsilon_bias: torch.Tensor
+    mu_weight: nn.Parameter
+    sigma_weight: nn.Parameter
+    mu_bias: nn.Parameter
+    sigma_bias: nn.Parameter
 
     def __init__(self, in_features: int, out_features: int,
                  sigma_init: float = 0.17) -> None:
@@ -139,7 +148,7 @@ class DuelingDQN(nn.Module):
 
 
 def build_model(device: torch.device, compile_model: bool = True,
-                noisy: bool = True) -> DuelingDQN:
+                noisy: bool = True) -> nn.Module:
     """Create a DuelingDQN and optionally torch.compile it for speed."""
     model = DuelingDQN(noisy=noisy).to(device)
     if compile_model and device.type == "cuda":
@@ -148,4 +157,4 @@ def build_model(device: torch.device, compile_model: bool = True,
             print("  [torch.compile] Model compiled for CUDA acceleration")
         except Exception as e:
             print(f"  [torch.compile] Skipped: {e}")
-    return model
+    return cast(nn.Module, model)

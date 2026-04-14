@@ -178,16 +178,16 @@ class PrioritizedReplayBuffer:
 
         self.tree = SumTree(cap)
 
-        pin = {"pin_memory": True} if torch.cuda.is_available() else {}
-        self._sg = torch.zeros((cap, GRID_CHANNELS, 16, 16), dtype=torch.float16, **pin)
-        self._sv = torch.zeros((cap, INV_FEATURES),          dtype=torch.float32, **pin)
-        self._a  = torch.zeros(cap,                          dtype=torch.int64,   **pin)
-        self._r  = torch.zeros(cap,                          dtype=torch.float32, **pin)
-        self._ng = torch.zeros((cap, GRID_CHANNELS, 16, 16), dtype=torch.float16, **pin)
-        self._nv = torch.zeros((cap, INV_FEATURES),          dtype=torch.float32, **pin)
-        self._d  = torch.zeros(cap,                          dtype=torch.float32, **pin)
-        self._t  = torch.zeros(cap,                          dtype=torch.int64,   **pin)
-        self._tm = torch.zeros(cap,                          dtype=torch.float32, **pin)
+        pin = torch.cuda.is_available()
+        self._sg = torch.zeros((cap, GRID_CHANNELS, 16, 16), dtype=torch.float16, pin_memory=pin)
+        self._sv = torch.zeros((cap, INV_FEATURES),          dtype=torch.float32, pin_memory=pin)
+        self._a  = torch.zeros(cap,                          dtype=torch.int64,   pin_memory=pin)
+        self._r  = torch.zeros(cap,                          dtype=torch.float32, pin_memory=pin)
+        self._ng = torch.zeros((cap, GRID_CHANNELS, 16, 16), dtype=torch.float16, pin_memory=pin)
+        self._nv = torch.zeros((cap, INV_FEATURES),          dtype=torch.float32, pin_memory=pin)
+        self._d  = torch.zeros(cap,                          dtype=torch.float32, pin_memory=pin)
+        self._t  = torch.zeros(cap,                          dtype=torch.int64,   pin_memory=pin)
+        self._tm = torch.zeros(cap,                          dtype=torch.float32, pin_memory=pin)
 
         self._max_priority = 1.0
 

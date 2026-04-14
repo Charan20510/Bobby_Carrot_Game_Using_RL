@@ -26,7 +26,7 @@ if not GAME_PYTHON_DIR.exists():
 if str(GAME_PYTHON_DIR) not in sys.path:
     sys.path.insert(0, str(GAME_PYTHON_DIR))
 
-from bobby_carrot.rl_env import BobbyCarrotEnv
+from bobby_carrot.rl_env import BobbyCarrotEnv  # type: ignore[missing-import]
 
 
 @dataclass

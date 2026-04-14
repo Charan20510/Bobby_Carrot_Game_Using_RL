@@ -50,7 +50,11 @@ class DQNAgent:
 
         self.policy = build_model(device, compile_model=compile_model, noisy=noisy)
         self.target = DuelingDQN(noisy=noisy).to(device)
-        self.target.load_state_dict(self.policy.state_dict())
+        
+        # Safe load (strips compile prefix if present)
+        unwrapped_policy = getattr(self.policy, '_orig_mod', self.policy)
+        unwrapped_target = getattr(self.target, '_orig_mod', self.target)
+        unwrapped_target.load_state_dict(unwrapped_policy.state_dict())
         self.target.eval()
 
         self.opt = optim.Adam(self.policy.parameters(), lr=lr,
@@ -68,6 +72,14 @@ class DQNAgent:
         self.use_amp = (device.type == "cuda")
         self.scaler  = torch.amp.GradScaler("cuda") if self.use_amp else None
         self.policy.train()
+
+    @property
+    def _unwrapped_policy(self) -> nn.Module:
+        return getattr(self.policy, '_orig_mod', self.policy)
+
+    @property
+    def _unwrapped_target(self) -> nn.Module:
+        return getattr(self.target, '_orig_mod', self.target)
 
     def act(self, grid: np.ndarray, inv: np.ndarray) -> int:
         """Single-observation action selection (used during play/eval)."""
@@ -178,7 +190,7 @@ class DQNAgent:
 
         # Periodic hard target update as backup
         if self.total_steps % self._target_upd == 0:
-            self.target.load_state_dict(self.policy.state_dict())
+            self._unwrapped_target.load_state_dict(self._unwrapped_policy.state_dict())
 
         return float(loss.item())
 
@@ -186,8 +198,8 @@ class DQNAgent:
              extra: Optional[Dict] = None) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         data = {
-            "policy":      self.policy.state_dict(),
-            "target":      self.target.state_dict(),
+            "policy":      self._unwrapped_policy.state_dict(),
+            "target":      self._unwrapped_target.state_dict(),
             "optim":       self.opt.state_dict(),
             "epsilon":     self.epsilon,
             "total_steps": self.total_steps,
@@ -211,8 +223,8 @@ class DQNAgent:
             print("  [load] Falling back to weights_only=False for legacy checkpoint")
             ck = torch.load(path, map_location=self.device, weights_only=False)
 
-        self.policy.load_state_dict(ck["policy"])
-        self.target.load_state_dict(ck.get("target", ck["policy"]))
+        self._unwrapped_policy.load_state_dict(ck["policy"])
+        self._unwrapped_target.load_state_dict(ck.get("target", ck["policy"]))
         if "optim" in ck:
             try:
                 self.opt.load_state_dict(ck["optim"])

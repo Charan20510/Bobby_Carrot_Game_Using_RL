@@ -29,7 +29,7 @@ if not _GAME_DIR.exists():
 if str(_GAME_DIR) not in sys.path:
     sys.path.insert(0, str(_GAME_DIR))
 
-from bobby_carrot.game import Map, MapInfo  # noqa: E402
+from bobby_carrot.game import Map, MapInfo  # type: ignore[missing-import] # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 N_ACTIONS = 4
@@ -482,6 +482,7 @@ class BobbyEnv:
             px, py = self.pos
             self._bfs, self._bfs_safe = _bfs_unified(self.md, px + py * 16)
             self._bfs_dirty = False
+        assert self._bfs is not None and self._bfs_safe is not None
         return self._bfs, self._bfs_safe
 
     # Keep legacy names for compatibility with teacher action code
