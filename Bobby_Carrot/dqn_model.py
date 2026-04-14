@@ -153,7 +153,9 @@ def build_model(device: torch.device, compile_model: bool = True,
     model = DuelingDQN(noisy=noisy).to(device)
     if compile_model and device.type == "cuda":
         try:
-            model = torch.compile(model, mode="reduce-overhead")  # type: ignore[assignment]
+            # Removed mode="reduce-overhead" because CUDAGraphs interacts poorly 
+            # with RL gradient accumulation and Double DQN un-stepped graph histories
+            model = torch.compile(model)  # type: ignore[assignment]
             print("  [torch.compile] Model compiled for CUDA acceleration")
         except Exception as e:
             print(f"  [torch.compile] Skipped: {e}")
