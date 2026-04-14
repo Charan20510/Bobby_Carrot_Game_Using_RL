@@ -163,7 +163,7 @@ class PrioritizedReplayBuffer:
     # Maximum allowed priority to prevent runaway feedback loops
     MAX_PRIORITY_CAP = 100.0
 
-    def __init__(self, cap: int = 300_000, alpha: float = 0.6,
+    def __init__(self, cap: int = 300_000, alpha: float = 0.5,
                  beta_start: float = 0.4, n_step: int = 3,
                  gamma: float = 0.99) -> None:
         self._cap   = cap

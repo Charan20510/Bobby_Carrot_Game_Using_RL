@@ -395,6 +395,12 @@ class BobbyEnv:
             revisit_pen = min(0.10, 0.05 * vc)
             reward -= revisit_pen
 
+        # ── Count-based intrinsic exploration (Reference §3) ──────────────
+        # r_i = c / sqrt(N(s)) — encourages visiting novel states
+        # Decays smoothly: 0.30 on 1st visit, 0.21 on 2nd, 0.17 on 3rd, ...
+        intrinsic = 0.3 / max(1.0, float(vc) ** 0.5)
+        reward += intrinsic
+
         self.step_count += 1
         self._steps_since_collect += 1
 

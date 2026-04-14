@@ -120,8 +120,9 @@ class DQNAgent:
             # Per-element TD errors (clamped for PER stability)
             td_errors = (qp - tgt).detach().clamp(-100.0, 100.0)
 
-            # Standard Huber loss weighted by PER importance sampling
-            td_loss = F.smooth_l1_loss(qp, tgt)
+            # Per-element Huber loss weighted by PER importance sampling
+            element_loss = F.smooth_l1_loss(qp, tgt, reduction="none")
+            td_loss = (element_loss * is_weights).mean()
 
             # Teacher distillation (only for warmup-collected transitions)
             if float(tm.sum().item()) > 0.0:

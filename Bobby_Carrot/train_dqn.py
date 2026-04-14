@@ -160,7 +160,7 @@ def train(
     resume:        bool  = False,
     seed:          int   = 42,
     target_update: int   = 500,
-    n_step:        int   = 3,
+    n_step:        int   = 4,
     noisy:         bool  = True,
 ) -> None:
 
@@ -727,7 +727,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed",          type=int,   default=42)
     p.add_argument("--play-episodes", type=int,   default=20)
     # Rainbow-lite options
-    p.add_argument("--n-step",        type=int,   default=3,
+    p.add_argument("--n-step",        type=int,   default=4,
                    help="N-step returns for faster credit assignment")
     p.add_argument("--no-noisy",      action="store_true",
                    help="Disable NoisyNet (use ε-greedy instead)")
