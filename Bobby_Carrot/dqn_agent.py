@@ -88,6 +88,8 @@ class DQNAgent:
         self.policy.reset_noise()
         g = torch.from_numpy(grid).unsqueeze(0).to(self.device, non_blocking=True)
         v = torch.from_numpy(inv).unsqueeze(0).to(self.device, non_blocking=True)
+        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
         with torch.no_grad():
             return int(self.policy(g, v).argmax(1).item())
 
@@ -102,6 +104,8 @@ class DQNAgent:
         n = len(grids)
         g = torch.from_numpy(np.stack(grids)).to(self.device, non_blocking=True)
         v = torch.from_numpy(np.stack(invs)).to(self.device, non_blocking=True)
+        if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
         with torch.no_grad():
             q_values = self.policy(g, v)  # (n, N_ACTIONS)
             best_actions = q_values.argmax(1).cpu().numpy()
@@ -132,6 +136,10 @@ class DQNAgent:
                 qn = self.target(ng, nv).gather(1, best_a).squeeze(1)
                 # N-step target: R_n + γⁿ × Q(s_{t+n})
                 tgt = (r + (1.0 - d) * self.replay.gamma_n * qn).clamp(-60.0, 60.0)
+
+            # Ensure the CUDAGraphs step is marked again before the training forward pass!
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
 
             q_all = self.policy(sg, sv)
             qp = q_all.gather(1, a).squeeze(1)
