@@ -2,7 +2,7 @@
 
 Rainbow-lite upgrade:
   - NoisyLinear layers in value/advantage heads for learned exploration
-  - 13-channel input with directional BFS hint
+  - 14-channel input with directional BFS hint + collected carrot memory
   - Residual connection in FC block
   - torch.compile() auto-applied on CUDA when available
 

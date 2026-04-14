@@ -4,8 +4,8 @@ Extracted from the monolithic train_dqn.py into a focused module.
 Key improvements over the original:
   - Unified single-pass BFS (was 2 separate BFS calls per step)
   - Pre-computed adjacency validity table (vectorised _can_move_tile)
-  - Stronger path-optimality rewards (BFS Δ 0.30, escalating revisit penalty)
-  - 13-channel grid observation with directional BFS hint
+  - De-noised reward shaping (no intrinsic bonuses, undo-move penalty)
+  - 14-channel grid observation with directional BFS hint + collected memory
 """
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from bobby_carrot.game import Map, MapInfo  # type: ignore[missing-import] # noq
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 N_ACTIONS = 4
-GRID_CHANNELS = 13  # 10 semantic + agent_pos + visited + direction_hint
+GRID_CHANNELS = 14  # 10 semantic + agent_pos + visited + direction_hint + collected_memory
 INV_FEATURES = 8
 
 # ── Tile class lookup table ───────────────────────────────────────────────────
@@ -214,6 +214,7 @@ class BobbyEnv:
 
         self.md          = np.zeros(256, dtype=np.uint8)
         self.pos         = (0, 0)
+        self._prev_pos: Optional[Tuple[int, int]] = None  # undo-move detection
         self.n_targets   = 0
         self.n_collected = 0
         self.key_gray = self.key_yellow = self.key_red = 0
@@ -222,6 +223,7 @@ class BobbyEnv:
         self.max_steps   = 400
         self._visited    = np.zeros(256, dtype=np.float32)
         self._visit_counts = np.zeros(256, dtype=np.int32)  # escalating revisit
+        self._collected_positions = np.zeros(256, dtype=np.float32)  # collected carrot memory
         # BFS cache (unified)
         self._bfs: Optional[np.ndarray] = None
         self._bfs_safe: Optional[np.ndarray] = None
@@ -235,9 +237,8 @@ class BobbyEnv:
         self._prev_bfs_dist  = -1
         self._stall_steps = 0
         self._stall_limit = 150
-        # Collection streak tracking (Rainbow-lite)
+        # Collection tracking
         self._steps_since_collect = 0
-        self._collect_streak = 0
 
     def set_level(self, level: int) -> None:
         """Switch to a different level (for multi-level training). Call reset() after."""
@@ -254,6 +255,7 @@ class BobbyEnv:
         mi = self._fresh
         self.md          = np.array(mi.data, dtype=np.uint8)
         self.pos         = mi.coord_start
+        self._prev_pos   = None  # no previous position at start
         self.n_targets   = int(mi.carrot_total) + int(mi.egg_total)
         self.n_collected = 0
         self.key_gray = self.key_yellow = self.key_red = 0
@@ -263,6 +265,7 @@ class BobbyEnv:
                             else _auto_max_steps(self.md))
         self._visited    = np.zeros(256, dtype=np.float32)
         self._visit_counts = np.zeros(256, dtype=np.int32)
+        self._collected_positions = np.zeros(256, dtype=np.float32)
         px, py = self.pos
         self._visited[px + py * 16] = 1.0
         self._visit_counts[px + py * 16] = 1
@@ -275,9 +278,8 @@ class BobbyEnv:
         # Stall
         self._stall_steps = 0
         self._stall_limit = max(200, self.max_steps // 2)
-        # Collection streak (Rainbow-lite)
+        # Collection tracking
         self._steps_since_collect = 0
-        self._collect_streak = 0
         # Compute initial BFS + reachability
         bfs, _ = self._get_bfs_pair()
         self._prev_reachable = _count_reachable(bfs, self.md)
@@ -328,14 +330,14 @@ class BobbyEnv:
             self._stall_steps += 1
             done = (self.step_count >= self.max_steps
                     or self._stall_steps >= self._stall_limit)
-            return -0.2, done, False
+            return -0.3, done, False
 
         nx, ny   = fx + dx, fy + dy
         from_idx = fx + fy * 16
         to_idx   = nx + ny * 16
         t_from   = int(self.md[from_idx])
         t_to     = int(self.md[to_idx])
-        reward   = -0.02
+        reward   = -0.05  # stronger step penalty for efficiency
         collected = False
 
         # ── Leaving tile mutations ────────────────────────────────────────
@@ -346,6 +348,7 @@ class BobbyEnv:
         if t_to == 31:  # death hole
             self.dead = True
             self.pos  = (nx, ny)
+            self._prev_pos = (fx, fy)
             self.step_count += 1
             self._bfs_dirty = True
             self._obs_dirty = True
@@ -354,12 +357,14 @@ class BobbyEnv:
         if t_to == 19:  # carrot
             self.md[to_idx] = 20
             self.n_collected += 1
-            reward += 5.0
+            self._collected_positions[to_idx] = 1.0  # remember where we collected
+            reward += 8.0  # stronger collection signal
             collected = True
         elif t_to == 45:  # egg
             self.md[to_idx] = 46
             self.n_collected += 1
-            reward += 5.0
+            self._collected_positions[to_idx] = 1.0
+            reward += 8.0
             collected = True
         elif t_to == 32:  # gray key
             self.md[to_idx] = 18; self.key_gray   += 1
@@ -378,28 +383,28 @@ class BobbyEnv:
         elif t_to == 38:  # blue switch
             _apply_lut(self.md, _LUT_BLU_F, _LUT_BLU_T)
 
-        # Update position
+        # ── Undo-move penalty (anti-oscillation) ─────────────────────────
+        is_undo = (self._prev_pos is not None and (nx, ny) == self._prev_pos)
+        if is_undo and not collected:
+            reward -= 0.15  # penalise going back to where you just were
+
+        # Update position tracking
+        self._prev_pos = (fx, fy)  # remember where we came from
         self.pos = (nx, ny)
         self._bfs_dirty = True
         self._obs_dirty = True
 
-        # ── Escalating revisit penalty (softened for maze backtracking) ──
+        # ── Escalating revisit penalty ────────────────────────────────────
         self._visit_counts[to_idx] += 1
         vc = self._visit_counts[to_idx]
         new_tile = self._visited[to_idx] == 0.0
         if new_tile:
             self._visited[to_idx] = 1.0
-            reward += 0.1
+            reward += 0.05  # small new-tile bonus
         else:
-            # Softened cap: -0.10 instead of -0.15 (L4 requires backtracking)
-            revisit_pen = min(0.10, 0.05 * vc)
+            # Graduated penalty with higher cap to discourage revisiting
+            revisit_pen = min(0.15, 0.03 * vc)
             reward -= revisit_pen
-
-        # ── Count-based intrinsic exploration (Reference §3) ──────────────
-        # r_i = c / sqrt(N(s)) — encourages visiting novel states
-        # Decays smoothly: 0.30 on 1st visit, 0.21 on 2nd, 0.17 on 3rd, ...
-        intrinsic = 0.3 / max(1.0, float(vc) ** 0.5)
-        reward += intrinsic
 
         self.step_count += 1
         self._steps_since_collect += 1
@@ -409,26 +414,19 @@ class BobbyEnv:
             self.finished = True
             return reward + 50.0, True, True
 
-        # ── Collection streak & efficiency bonus (Rainbow-lite) ───────────
+        # ── Collection efficiency bonus ───────────────────────────────────
         if collected and self.n_targets > 0:
             progress = self.n_collected / self.n_targets
 
-            # Streak bonus: rapid successive collections are rewarded
-            if self._steps_since_collect <= 15:
-                self._collect_streak += 1
-                reward += 0.5 * self._collect_streak  # escalating streak
-            else:
-                self._collect_streak = 1
-
             # Path efficiency: bonus for finding short paths between targets
             efficiency = max(0.0, 1.0 - self._steps_since_collect / max(1.0, float(self.max_steps)))
-            reward += 1.0 * efficiency
+            reward += 0.5 * efficiency
 
             self._steps_since_collect = 0
 
             # Milestone bonuses
             if self.n_collected == self.n_targets:
-                reward += 10.0  # all targets collected
+                reward += 15.0  # all targets collected — strong signal
             elif progress >= 0.75 and (self.n_collected - 1) / self.n_targets < 0.75:
                 reward += 3.0   # 75% milestone
             elif progress >= 0.50 and (self.n_collected - 1) / self.n_targets < 0.50:
@@ -455,16 +453,16 @@ class BobbyEnv:
             if exit_mask.any() and not np.any(bfs[exit_mask] >= 0):
                 return reward - 30.0, True, False
 
-        # ── BFS distance shaping (STRONGER: 0.50) ────────────────────────
+        # ── BFS distance shaping ──────────────────────────────────────────
         bfs_to = self._bfs_to_nearest(bfs)
         if bfs_to >= 0 and self._prev_bfs_dist >= 0 and not collected:
             delta_d = self._prev_bfs_dist - bfs_to
-            reward += 0.50 * delta_d  # was 0.30, increased for faster convergence
+            reward += 0.30 * delta_d  # reduced from 0.50 to lower noise
         self._prev_bfs_dist = bfs_to
 
-        # ── Time pressure (quadratic) ─────────────────────────────────────
+        # ── Time pressure (quadratic, stronger) ──────────────────────────
         t_frac = float(self.step_count) / max(1.0, float(self.max_steps))
-        reward -= 0.01 * t_frac * t_frac
+        reward -= 0.03 * t_frac * t_frac
 
         # ── Stall detection ───────────────────────────────────────────────
         if collected or new_tile:
@@ -495,14 +493,14 @@ class BobbyEnv:
         return bfs_safe
 
     def get_obs(self) -> Tuple[np.ndarray, np.ndarray]:
-        """13-channel grid + 8-dim inventory vector."""
+        """14-channel grid + 8-dim inventory vector."""
         if not self._obs_dirty and self._cached_grid is not None:
             return self._cached_grid, self._cached_inv  # type: ignore[return-value]
 
         px, py = self.pos
         md     = self.md
 
-        # 13-channel grid
+        # 14-channel grid
         grid = np.zeros((GRID_CHANNELS, 16, 16), dtype=np.float32)
 
         # Channels 0-9: semantic one-hot
@@ -518,12 +516,15 @@ class BobbyEnv:
         all_done = self.n_collected == self.n_targets
         tmask = (md == 44) if all_done else ((md == 19) | (md == 45))
 
+        # Determine which BFS to use for gradient/hint:
+        # If any targets reachable without crumbling, prefer safe BFS.
+        # Otherwise use normal BFS (critical for all-crumble levels).
         safe_reachable = tmask & (bfs_safe >= 0)
         if safe_reachable.any():
             bfs_for_grad = bfs_safe
             bfs_to_target = int(bfs_safe[safe_reachable].min())
         else:
-            bfs_for_grad = bfs
+            bfs_for_grad = bfs  # fallback to normal BFS
             bfs_to_target = 32
             if tmask.any():
                 tdist = bfs[tmask]
@@ -545,23 +546,41 @@ class BobbyEnv:
         # Channel 11 — visited mask
         grid[11] = self._visited.reshape(16, 16)
 
-        # Channel 12 — directional BFS hint (NEW)
-        # Encodes normalized direction to nearest target at each reachable cell
+        # Channel 12 — directional BFS hint (FIXED)
+        # Compute reverse BFS from nearest target → mark which agent neighbors
+        # are on the shortest path toward that target.
+        # Old approach was broken: BFS from agent always has dist[agent]=0,
+        # dist[neighbor]=1, so no neighbor could be "closer".
         dir_hint = np.zeros(256, dtype=np.float32)
-        for di, delta in enumerate([-1, 1, -16, 16]):
-            # For the agent's current position, mark which neighbor is closest
-            agent_idx = px + py * 16
-            ni = agent_idx + delta
-            if 0 <= ni < 256:
-                nx_c, ny_c = ni % 16, ni // 16
-                # Boundary check
-                if delta == -1 and px == 0: continue
-                if delta == 1 and px == 15: continue
-                if delta == -16 and py == 0: continue
-                if delta == 16 and py == 15: continue
-                if bfs_for_grad[ni] >= 0 and bfs_for_grad[ni] < bfs_for_grad[agent_idx]:
-                    dir_hint[ni] = 1.0
+        agent_idx = px + py * 16
+
+        # Find nearest target position
+        if tmask.any():
+            target_dists = bfs_for_grad.copy()
+            target_dists[~tmask] = 9999  # ignore non-targets
+            target_dists[target_dists < 0] = 9999
+            nearest_target_idx = int(np.argmin(target_dists))
+            if target_dists[nearest_target_idx] < 9999:
+                # Run reverse BFS from that target
+                rev_bfs, _ = _bfs_unified(md, nearest_target_idx)
+                agent_dist_to_target = int(rev_bfs[agent_idx]) if rev_bfs[agent_idx] >= 0 else -1
+                if agent_dist_to_target > 0:
+                    for di, delta in enumerate([-1, 1, -16, 16]):
+                        ni = agent_idx + delta
+                        if not (0 <= ni < 256):
+                            continue
+                        if delta == -1 and px == 0: continue
+                        if delta == 1 and px == 15: continue
+                        if delta == -16 and py == 0: continue
+                        if delta == 16 and py == 15: continue
+                        if rev_bfs[ni] >= 0 and rev_bfs[ni] < agent_dist_to_target:
+                            dir_hint[ni] = 1.0
         grid[12] = dir_hint.reshape(16, 16)
+
+        # Channel 13 — collected carrot/egg memory
+        # Binary mask showing positions where carrots/eggs WERE collected.
+        # Helps the agent avoid revisiting already-cleared locations.
+        grid[13] = self._collected_positions.reshape(16, 16)
 
         # Inventory vector (8 features)
         n_rem     = self.n_targets - self.n_collected

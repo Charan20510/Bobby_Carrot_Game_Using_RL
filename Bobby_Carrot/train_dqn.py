@@ -91,7 +91,12 @@ def _parse_levels(s: str) -> List[int]:
 
 # ── BFS teacher helpers ───────────────────────────────────────────────────────
 def _bfs_teacher_action(env: BobbyEnv) -> Optional[int]:
-    """Return a BFS-guided action when a reachable target exists."""
+    """Return a BFS-guided action when a reachable target exists.
+
+    FIXED: breaks ties by preferring unvisited tiles and avoiding undo-moves
+    to prevent oscillation (the old teacher bounced Left<->Right forever on
+    crumble-heavy levels where all targets are equidistant).
+    """
     bfs = env.get_bfs()
     bfs_safe = env.get_bfs_safe()
     px, py = env.pos
@@ -110,19 +115,25 @@ def _bfs_teacher_action(env: BobbyEnv) -> Optional[int]:
             return None
         use_bfs = bfs
 
-    best_action: Optional[int] = None
-    best_dist: Optional[int] = None
+    candidates: List[Tuple[int, int, bool, bool]] = []  # (action, dist, is_new, is_not_undo)
     for action, (dx, dy) in enumerate(ACTION_DELTA):
         if not env._can_move(px, py, dx, dy):
             continue
         nx, ny = px + dx, py + dy
-        dist = int(use_bfs[nx + ny * 16])
+        ni = nx + ny * 16
+        dist = int(use_bfs[ni])
         if dist < 0:
             continue
-        if best_dist is None or dist < best_dist:
-            best_dist = dist
-            best_action = action
-    return best_action
+        is_new = env._visited[ni] == 0.0  # prefer unvisited tiles
+        is_not_undo = (env._prev_pos is None or (nx, ny) != env._prev_pos)
+        candidates.append((action, dist, is_new, is_not_undo))
+
+    if not candidates:
+        return None
+
+    # Sort by: (1) shortest BFS distance, (2) prefer unvisited, (3) prefer non-undo
+    candidates.sort(key=lambda c: (c[1], not c[2], not c[3]))
+    return candidates[0][0]
 
 
 def _bfs_best_action(env: BobbyEnv) -> int:
