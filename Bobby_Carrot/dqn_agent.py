@@ -120,14 +120,21 @@ class DQNAgent:
         self.target.reset_noise()
 
         def _loss() -> tuple:
-            q_all = self.policy(sg, sv)
-            qp = q_all.gather(1, a).squeeze(1)
+            # Mark the beginning of a step for CUDAGraphs
+            if hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                torch.compiler.cudagraph_mark_step_begin()
+
             with torch.no_grad():
-                # Double DQN: policy selects action, target evaluates
+                # Double DQN: policy selects action, target evaluates.
+                # Performed FIRST so its CUDAGraph execution doesn't overwrite
+                # the training activations of the main policy pass (needed for .backward()).
                 best_a = self.policy(ng, nv).argmax(1, keepdim=True)
                 qn = self.target(ng, nv).gather(1, best_a).squeeze(1)
                 # N-step target: R_n + γⁿ × Q(s_{t+n})
                 tgt = (r + (1.0 - d) * self.replay.gamma_n * qn).clamp(-60.0, 60.0)
+
+            q_all = self.policy(sg, sv)
+            qp = q_all.gather(1, a).squeeze(1)
 
             # Per-element TD errors (clamped for PER stability)
             td_errors = (qp - tgt).detach().clamp(-100.0, 100.0)
