@@ -140,11 +140,6 @@ class DQNAgent:
             element_loss = F.smooth_l1_loss(qp, tgt, reduction="none")
             td_loss = (element_loss * is_weights).mean()
 
-            # Teacher distillation (only for warmup-collected transitions)
-            if float(tm.sum().item()) > 0.0:
-                teacher_loss = F.cross_entropy(q_all, t, reduction="none")
-                teacher_loss = (teacher_loss * tm).sum() / tm.sum().clamp_min(1.0)
-                return td_loss + self.teacher_weight * teacher_loss, td_errors
             return td_loss, td_errors
 
         if self.use_amp:

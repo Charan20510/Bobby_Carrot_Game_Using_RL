@@ -284,19 +284,17 @@ def train(
                 warmup_done = True
                 print(f"  [warmup done] Switching to {'NoisyNet' if noisy else 'ε-greedy'} exploration")
 
-            # NoisyNet: just use policy (noise provides exploration)
-            # ε-greedy fallback: use epsilon for exploration
+            # NoisyNet: use policy (noise provides exploration), plus a 2% safety net
+            # ε-greedy fallback: use current epsilon for exploration
             policy_actions = agent.act_batch(grids, invs)
 
-            if noisy:
-                actions = policy_actions
-            else:
-                actions = []
-                for i, env in enumerate(envs):
-                    if random.random() < agent.epsilon:
-                        actions.append(random.randint(0, N_ACTIONS - 1))
-                    else:
-                        actions.append(policy_actions[i])
+            actions = []
+            cur_eps = agent.epsilon if not noisy else max(0.02, agent.epsilon)
+            for i, env in enumerate(envs):
+                if random.random() < cur_eps:
+                    actions.append(random.randint(0, N_ACTIONS - 1))
+                else:
+                    actions.append(policy_actions[i])
 
         # ── Step all envs and collect transitions ─────────────────────────
         for i, env in enumerate(envs):
@@ -386,17 +384,16 @@ def train(
             else:
                 early_win = 0
 
-            # Stagnation detection (only for non-noisy mode)
-            if not noisy:
-                if sr < 0.01 and cr > 0.60 and total_eps > warmup_eps + 200:
-                    stag_count += 1
-                    if stag_count >= 3:
-                        old_eps = agent.epsilon
-                        agent.epsilon = max(agent.epsilon, 0.30)
-                        print(f"  [!] Stagnation: eps {old_eps:.3f} -> {agent.epsilon:.3f}")
-                        stag_count = 0
-                else:
+            # Stagnation detection (rescue mechanism for both modes)
+            if sr < 0.01 and cr < 0.30 and total_eps > warmup_eps + 200:
+                stag_count += 1
+                if stag_count >= 3:
+                    old_eps = agent.epsilon
+                    agent.epsilon = max(agent.epsilon, 0.40)
+                    print(f"  [!] Stagnation detected. Boosting random exploration: {old_eps:.3f} -> {agent.epsilon:.3f}")
                     stag_count = 0
+            else:
+                stag_count = 0
 
         next_save = ((last_save_ep // save_every) + 1) * save_every if last_save_ep >= 0 else save_every
         if total_eps >= next_save and total_eps != last_save_ep:
