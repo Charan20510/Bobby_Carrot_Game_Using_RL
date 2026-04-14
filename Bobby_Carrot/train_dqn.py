@@ -645,7 +645,8 @@ def play_gui(
                     else:
                         src = Rect(32 * (item % 8), 32 * (item // 8), 32, 32)
                     dest = Rect(x * 32 - cam_x, y * 32 - cam_y, 32, 32)
-                    screen.blit(texture, dest, src)
+                    if texture is not None:
+                        screen.blit(texture, dest, src)
 
             # Bobby sprite
             bobby_src, bobby_dest = bobby.update_texture_position(frame, map_info.data)
@@ -660,7 +661,8 @@ def play_gui(
                 State.Down: assets.bobby_down,
             }[bobby.state]
             bobby_dest = bobby_dest.move(-cam_x, -cam_y)
-            screen.blit(bobby_tex, bobby_dest, bobby_src)
+            if bobby_tex is not None:
+                screen.blit(bobby_tex, bobby_dest, bobby_src)
 
             # HUD counter
             if map_info.carrot_total > 0:
@@ -671,17 +673,19 @@ def play_gui(
                 icon_rect = Rect(46, 0, 34, 44)
                 num_left  = map_info.egg_total - bobby.egg_count
                 icon_width = 34
-            screen.blit(assets.hud,
-                        (32*16 - (icon_width+4) - x_right_offset, 4 + y_offset),
-                        icon_rect)
-            num_10 = num_left // 10
-            num_01 = num_left % 10
-            screen.blit(assets.numbers,
-                        (32*16 - (icon_width+4) - 2 - 12 - x_right_offset, 4+14+y_offset),
-                        Rect(num_01*12, 0, 12, 18))
-            screen.blit(assets.numbers,
-                        (32*16 - (icon_width+4) - 2 - 12*2 - 1 - x_right_offset, 4+14+y_offset),
-                        Rect(num_10*12, 0, 12, 18))
+            if assets.hud is not None:
+                screen.blit(assets.hud,
+                            (32*16 - (icon_width+4) - x_right_offset, 4 + y_offset),
+                            icon_rect)
+            if assets.numbers is not None:
+                num_10 = num_left // 10
+                num_01 = num_left % 10
+                screen.blit(assets.numbers,
+                            (32*16 - (icon_width+4) - 2 - 12 - x_right_offset, 4+14+y_offset),
+                            Rect(num_01*12, 0, 12, 18))
+                screen.blit(assets.numbers,
+                            (32*16 - (icon_width+4) - 2 - 12*2 - 1 - x_right_offset, 4+14+y_offset),
+                            Rect(num_10*12, 0, 12, 18))
 
             pygame.display.flip()
             frame += 1
