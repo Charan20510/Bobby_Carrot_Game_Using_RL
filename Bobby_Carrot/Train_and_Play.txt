@@ -112,13 +112,13 @@ NOTE: You cannot run `--play-gui` in Google Colab because Colab does not have a 
 To watch the agent play, download the `.pt` models from your Google Drive to your local machine, put them in a folder (e.g. `dqn_checkpoints`), and run:
 
 # Watch Level 3
-python Bobby_Carrot/train_dqn.py --play-gui --level 3 --model-path "dqn_checkpoints/dqn_normal3_5_best.pt"
+python Bobby_Carrot/train_dqn.py --play-gui --level 3 --model-path ".\Bobby_Carrot\dqn_normal3_5_best.pt"
 
 # Watch Level 4
-python Bobby_Carrot/train_dqn.py --play-gui --level 4 --model-path "dqn_checkpoints/dqn_normal3_5_best.pt"
+python Bobby_Carrot/train_dqn.py --play-gui --level 4 --model-path ".\Bobby_Carrot\dqn_normal3_5_best.pt"
 
 # Watch Level 5
-python Bobby_Carrot/train_dqn.py --play-gui --level 5 --model-path "dqn_checkpoints/dqn_normal3_5_best.pt"
+python Bobby_Carrot/train_dqn.py --play-gui --level 5 --model-path ".\Bobby_Carrot\dqn_normal3_5_best.pt"
 
 ==================    IMPORTANT RULES    ==================
 

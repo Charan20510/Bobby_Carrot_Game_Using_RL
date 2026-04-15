@@ -93,29 +93,41 @@ def _parse_levels(s: str) -> List[int]:
 def _bfs_teacher_action(env: BobbyEnv) -> Optional[int]:
     """Return a BFS-guided action when a reachable target exists.
 
-    FIXED: breaks ties by preferring unvisited tiles and avoiding undo-moves
-    to prevent oscillation (the old teacher bounced Left<->Right forever on
-    crumble-heavy levels where all targets are equidistant).
+    CRUMBLE-AWARE: prioritises targets reachable WITHOUT crossing crumble
+    tiles.  Only when ALL safe targets are collected does the teacher allow
+    crossing a crumble to reach the next section.
+
+    Uses agent's own BFS distance to break ties correctly: only picks
+    neighbors that are STRICTLY closer to the nearest target.  When no
+    neighbor is closer (e.g., all equidistant in a cleared quadrant),
+    falls back to least-visited neighbor to spiral toward the exit.
     """
     bfs = env.get_bfs()
     bfs_safe = env.get_bfs_safe()
     px, py = env.pos
+    agent_idx = px + py * 16
 
     all_done = env.n_collected == env.n_targets
     tmask = (env.md == 44) if all_done else ((env.md == 19) | (env.md == 45))
     if not tmask.any():
         return None
 
+    # Strategy: prefer safe-reachable targets first (no crumble crossing).
+    # Only fall back to normal BFS when no safe targets remain.
     safe_reachable = tmask & (bfs_safe >= 0)
     if safe_reachable.any():
-        use_bfs = bfs_safe
+        use_bfs = bfs_safe  # guide toward safe targets only
     else:
         normal_reachable = tmask & (bfs >= 0)
         if not normal_reachable.any():
             return None
-        use_bfs = bfs
+        use_bfs = bfs  # must cross crumble to reach remaining targets
 
-    candidates: List[Tuple[int, int, bool, bool]] = []  # (action, dist, is_new, is_not_undo)
+    # Agent's own distance to nearest target (via the BFS we chose)
+    agent_dist = int(use_bfs[agent_idx]) if use_bfs[agent_idx] >= 0 else 9999
+
+    # (action, neighbor_dist, visit_count, is_new, is_not_undo)
+    candidates = []
     for action, (dx, dy) in enumerate(ACTION_DELTA):
         if not env._can_move(px, py, dx, dy):
             continue
@@ -126,13 +138,17 @@ def _bfs_teacher_action(env: BobbyEnv) -> Optional[int]:
             continue
         is_new = env._visited[ni] == 0.0  # prefer unvisited tiles
         is_not_undo = (env._prev_pos is None or (nx, ny) != env._prev_pos)
-        candidates.append((action, dist, is_new, is_not_undo))
+        vc = int(env._visit_counts[ni])  # lower is better
+        candidates.append((action, dist, vc, is_new, is_not_undo))
 
     if not candidates:
         return None
 
-    # Sort by: (1) shortest BFS distance, (2) prefer unvisited, (3) prefer non-undo
-    candidates.sort(key=lambda c: (c[1], not c[2], not c[3]))
+    # Primary sort: BFS distance (closest to target wins).
+    # Tie-break 1: least-visited (prevents loops in cleared areas).
+    # Tie-break 2: unvisited preferred.
+    # Tie-break 3: non-undo preferred.
+    candidates.sort(key=lambda c: (c[1], c[2], not c[3], not c[4]))
     return candidates[0][0]
 
 

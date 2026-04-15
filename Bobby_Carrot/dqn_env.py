@@ -234,6 +234,7 @@ class BobbyEnv:
         self._cached_inv:  Optional[np.ndarray] = None
         # Reward shaping state
         self._prev_reachable = 0
+        self._prev_safe_reachable = 0  # crumble-safe reachable targets
         self._prev_bfs_dist  = -1
         self._stall_steps = 0
         self._stall_limit = 150
@@ -281,8 +282,9 @@ class BobbyEnv:
         # Collection tracking
         self._steps_since_collect = 0
         # Compute initial BFS + reachability
-        bfs, _ = self._get_bfs_pair()
+        bfs, bfs_safe = self._get_bfs_pair()
         self._prev_reachable = _count_reachable(bfs, self.md)
+        self._prev_safe_reachable = _count_reachable(bfs_safe, self.md)
         self._prev_bfs_dist = self._bfs_to_nearest(bfs)
 
     def _can_move(self, fx: int, fy: int, dx: int, dy: int) -> bool:
@@ -383,10 +385,14 @@ class BobbyEnv:
         elif t_to == 38:  # blue switch
             _apply_lut(self.md, _LUT_BLU_F, _LUT_BLU_T)
 
+        # ── Crumble-crossing penalty (irreversible move) ──────────────────
+        if t_from == 30:  # just left a crumble tile — it collapses behind us
+            reward -= 0.5  # cost for irreversible move
+
         # ── Undo-move penalty (anti-oscillation) ─────────────────────────
         is_undo = (self._prev_pos is not None and (nx, ny) == self._prev_pos)
         if is_undo and not collected:
-            reward -= 0.15  # penalise going back to where you just were
+            reward -= 0.30  # penalise going back to where you just were
 
         # Update position tracking
         self._prev_pos = (fx, fy)  # remember where we came from
@@ -403,7 +409,7 @@ class BobbyEnv:
             reward += 0.05  # small new-tile bonus
         else:
             # Graduated penalty with higher cap to discourage revisiting
-            revisit_pen = min(0.15, 0.03 * vc)
+            revisit_pen = min(0.30, 0.05 * vc)
             reward -= revisit_pen
 
         self.step_count += 1
@@ -435,7 +441,7 @@ class BobbyEnv:
                 reward += 1.0   # 25% milestone
 
         # ── Reachability check ────────────────────────────────────────────
-        bfs, _ = self._get_bfs_pair()
+        bfs, bfs_safe = self._get_bfs_pair()
         remaining = int(np.sum((self.md == 19) | (self.md == 45)))
 
         if remaining > 0:
@@ -447,8 +453,20 @@ class BobbyEnv:
             self._prev_reachable = reachable
             if reachable == 0:
                 return reward - 30.0, True, False
+
+            # ── Crumble-stranding penalty (proactive) ─────────────────────
+            # Penalise when crossing a crumble reduces safe-reachable targets
+            # (softer than full-unreachable, gives earlier gradient signal)
+            safe_reachable = _count_reachable(bfs_safe, self.md)
+            expected_safe = self._prev_safe_reachable - (1 if collected else 0)
+            safe_lost = max(0, expected_safe - safe_reachable)
+            if safe_lost > 0 and t_from == 30:
+                # Agent crossed a crumble and stranded targets on old side
+                reward -= 2.0 * safe_lost
+            self._prev_safe_reachable = safe_reachable
         else:
             self._prev_reachable = 0
+            self._prev_safe_reachable = 0
             exit_mask = self.md == 44
             if exit_mask.any() and not np.any(bfs[exit_mask] >= 0):
                 return reward - 30.0, True, False
@@ -546,36 +564,15 @@ class BobbyEnv:
         # Channel 11 — visited mask
         grid[11] = self._visited.reshape(16, 16)
 
-        # Channel 12 — directional BFS hint (FIXED)
-        # Compute reverse BFS from nearest target → mark which agent neighbors
-        # are on the shortest path toward that target.
-        # Old approach was broken: BFS from agent always has dist[agent]=0,
-        # dist[neighbor]=1, so no neighbor could be "closer".
-        dir_hint = np.zeros(256, dtype=np.float32)
-        agent_idx = px + py * 16
-
-        # Find nearest target position
-        if tmask.any():
-            target_dists = bfs_for_grad.copy()
-            target_dists[~tmask] = 9999  # ignore non-targets
-            target_dists[target_dists < 0] = 9999
-            nearest_target_idx = int(np.argmin(target_dists))
-            if target_dists[nearest_target_idx] < 9999:
-                # Run reverse BFS from that target
-                rev_bfs, _ = _bfs_unified(md, nearest_target_idx)
-                agent_dist_to_target = int(rev_bfs[agent_idx]) if rev_bfs[agent_idx] >= 0 else -1
-                if agent_dist_to_target > 0:
-                    for di, delta in enumerate([-1, 1, -16, 16]):
-                        ni = agent_idx + delta
-                        if not (0 <= ni < 256):
-                            continue
-                        if delta == -1 and px == 0: continue
-                        if delta == 1 and px == 15: continue
-                        if delta == -16 and py == 0: continue
-                        if delta == 16 and py == 15: continue
-                        if rev_bfs[ni] >= 0 and rev_bfs[ni] < agent_dist_to_target:
-                            dir_hint[ni] = 1.0
-        grid[12] = dir_hint.reshape(16, 16)
+        # Channel 12 — crumble-safe zone mask
+        # 1.0 = reachable from agent without crossing any crumble tile
+        # 0.0 = requires crossing at least one crumble to reach
+        # This tells the agent "stay here until you've collected everything
+        # in the 1.0 zone before crossing a crumble."
+        # Much cheaper than the old reverse-BFS directional hint AND more
+        # informative for crumble-ordering decisions.
+        safe_zone = np.where(bfs_safe >= 0, 1.0, 0.0).astype(np.float32)
+        grid[12] = safe_zone.reshape(16, 16)
 
         # Channel 13 — collected carrot/egg memory
         # Binary mask showing positions where carrots/eggs WERE collected.
