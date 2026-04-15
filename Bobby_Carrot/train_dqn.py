@@ -162,6 +162,17 @@ def _bfs_best_action(env: BobbyEnv) -> int:
     return random.choice(valid) if valid else random.randint(0, N_ACTIONS - 1)
 
 
+def _save_checkpoint_copies(agent, targets: List[Path], level: int, map_kind: str,
+                            extra: Optional[Dict] = None) -> None:
+    seen = set()
+    for target in targets:
+        key = str(target)
+        if key in seen:
+            continue
+        seen.add(key)
+        agent.save(target, level, map_kind, extra=extra)
+
+
 # ── Training loop ─────────────────────────────────────────────────────────────
 def train(
     map_kind:      str   = "normal",
@@ -184,6 +195,7 @@ def train(
     target_cr:     float = 0.90,
     model_path:    str   = "",
     ckpt_dir:      str   = "dqn_checkpoints",
+    mirror_ckpt_dir: str = "",
     resume:        bool  = False,
     seed:          int   = 42,
     target_update: int   = 500,
@@ -216,6 +228,7 @@ def train(
 
     ckpt = Path(ckpt_dir)
     ckpt.mkdir(parents=True, exist_ok=True)
+    mirror_ckpt = Path(mirror_ckpt_dir) if mirror_ckpt_dir else None
     if not model_path:
         if multi:
             model_path = str(ckpt / f"dqn_{map_kind}{min(level_pool)}_{max(level_pool)}.pt")
@@ -288,6 +301,12 @@ def train(
 
     last_report_ep = -1
     last_save_ep   = -1
+
+    def _mirror_targets(primary: Path) -> List[Path]:
+        targets = [primary]
+        if mirror_ckpt is not None:
+            targets.append(mirror_ckpt / primary.name)
+        return targets
 
     while total_eps < target_eps:
         # ── BATCHED observation collection ────────────────────────────────
@@ -398,15 +417,25 @@ def train(
                 best_sr = sr
                 best_name = (f"dqn_{map_kind}{min(level_pool)}_{max(level_pool)}_best.pt"
                              if multi else f"dqn_{map_kind}{level_pool[0]}_best.pt")
-                agent.save(ckpt / best_name, level_pool[0], map_kind,
-                           extra={"total_eps": total_eps, "best_sr": best_sr})
+                _save_checkpoint_copies(
+                    agent,
+                    _mirror_targets(ckpt / best_name),
+                    level_pool[0],
+                    map_kind,
+                    extra={"total_eps": total_eps, "best_sr": best_sr},
+                )
 
             if sr >= target_sr and cr >= target_cr and total_eps >= 200:
                 early_win += 1
                 if early_win >= 3:
                     print(f"[{tag}] Early stop: sr={sr:.1%} cr={cr:.1%}")
-                    agent.save(out, level_pool[0], map_kind,
-                               extra={"total_eps": total_eps, "best_sr": best_sr})
+                    _save_checkpoint_copies(
+                        agent,
+                        _mirror_targets(out),
+                        level_pool[0],
+                        map_kind,
+                        extra={"total_eps": total_eps, "best_sr": best_sr},
+                    )
                     return
             else:
                 early_win = 0
@@ -425,11 +454,21 @@ def train(
         next_save = ((last_save_ep // save_every) + 1) * save_every if last_save_ep >= 0 else save_every
         if total_eps >= next_save and total_eps != last_save_ep:
             last_save_ep = total_eps
-            agent.save(out, level_pool[0], map_kind,
-                       extra={"total_eps": total_eps, "best_sr": best_sr})
+            _save_checkpoint_copies(
+                agent,
+                _mirror_targets(out),
+                level_pool[0],
+                map_kind,
+                extra={"total_eps": total_eps, "best_sr": best_sr},
+            )
 
-    agent.save(out, level_pool[0], map_kind,
-               extra={"total_eps": total_eps, "best_sr": best_sr})
+    _save_checkpoint_copies(
+        agent,
+        _mirror_targets(out),
+        level_pool[0],
+        map_kind,
+        extra={"total_eps": total_eps, "best_sr": best_sr},
+    )
     if completed_win:
         window = min(100, len(completed_win))
         print(f"\nDone. Best success={best_sr:.1%} | "
@@ -735,6 +774,8 @@ def _build_parser() -> argparse.ArgumentParser:
                         "(e.g., '3-25' or '3,5,7'). Overrides --level.")
     p.add_argument("--model-path",    default="")
     p.add_argument("--ckpt-dir",      default="dqn_checkpoints")
+    p.add_argument("--mirror-ckpt-dir", default="",
+                   help="Optional second checkpoint folder to mirror every save")
     p.add_argument("--episodes",      type=int,   default=4000)
     p.add_argument("--max-steps",     type=int,   default=None)
     p.add_argument("--lr",            type=float, default=3e-4)
@@ -789,6 +830,7 @@ def main() -> None:
               report_every=args.report_every, save_every=args.save_every,
               target_sr=args.target_sr, target_cr=args.target_cr,
               model_path=args.model_path, ckpt_dir=args.ckpt_dir,
+              mirror_ckpt_dir=args.mirror_ckpt_dir,
               resume=args.resume, seed=args.seed,
               target_update=args.target_update,
               n_step=args.n_step, noisy=noisy)

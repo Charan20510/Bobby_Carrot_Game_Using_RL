@@ -78,10 +78,10 @@ Note: Adjust the --level and --model-path depending on the level you are current
 Because we just upgraded the agent to a "Rainbow-lite" architecture (PER + N-step + Count-based exploration), the agent is now powerful enough to learn generalized maze navigation. We can train it on levels 3, 4, and 5 simultaneously!
 
 # Setup (run once in Colab)
-!git clone https://github.com/Charan20510/Bobby_Carrot_Game_Using_RL.git
-%cd Bobby_Carrot_Game_Using_RL
+!git clone -b master https://github.com/Charan20510/Bobby_Carrot_Game_using_RL.git
+%cd Bobby_Carrot_Game_using_RL
 !pip install torch pygame numpy -q
-from google.colab import drive; drive.mount('/content/drive')
+from google.colab import drive; drive.mount('/content/drive', force_remount=True)
 
 # Generalized Training (Levels 3, 4, and 5 together)
 # This will take longer (e.g., 6000-8000 episodes) but produces a much smarter agent.
@@ -91,7 +91,8 @@ from google.colab import drive; drive.mount('/content/drive')
   --warmup-eps 50 \
   --n-envs 8 \
   --model-path "/content/drive/MyDrive/bobby_models/L3_5/dqn_normal3_5.pt" \
-  --ckpt-dir "/content/drive/MyDrive/bobby_models/L3_5" \
+  --ckpt-dir "dqn_checkpoints" \
+  --mirror-ckpt-dir "/content/drive/MyDrive/bobby_models/L3_5" \
   --report-every 100 \
   --save-every 500
 
@@ -103,7 +104,8 @@ from google.colab import drive; drive.mount('/content/drive')
   --n-envs 8 \
   --resume \
   --model-path "/content/drive/MyDrive/bobby_models/L3_5/dqn_normal3_5.pt" \
-  --ckpt-dir "/content/drive/MyDrive/bobby_models/L3_5"
+  --ckpt-dir "dqn_checkpoints" \
+  --mirror-ckpt-dir "/content/drive/MyDrive/bobby_models/L3_5"
 
 
 ==================    LOCAL GUI PLAYBACK    ==================
