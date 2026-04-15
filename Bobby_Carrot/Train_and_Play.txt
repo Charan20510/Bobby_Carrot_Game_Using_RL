@@ -73,6 +73,122 @@ python train_dqn.py \
 
 Note: Adjust the --level and --model-path depending on the level you are currently training.
 
+
+==================    INDIVIDUAL LEVEL TRAINING (LEVELS 3, 4, 5)    ==================
+
+Train each level separately with dedicated checkpoints.
+Each level gets focused training time on its specific puzzle structure.
+
+# --- Level 3 (12 carrots, crumble corridor) ---
+python Bobby_Carrot/train_dqn.py \
+  --level 3 \
+  --episodes 5000 \
+  --warmup-eps 50 \
+  --n-envs 8 \
+  --model-path "dqn_checkpoints/dqn_normal3.pt" \
+  --ckpt-dir "dqn_checkpoints" \
+  --report-every 100 \
+  --save-every 500
+
+# --- Level 4 (35 carrots, 4 crumble-gated quadrants) ---
+python Bobby_Carrot/train_dqn.py \
+  --level 4 \
+  --episodes 8000 \
+  --warmup-eps 80 \
+  --n-envs 8 \
+  --model-path "dqn_checkpoints/dqn_normal4.pt" \
+  --ckpt-dir "dqn_checkpoints" \
+  --report-every 100 \
+  --save-every 500
+
+# --- Level 5 (19 carrots, complex crumble topology) ---
+python Bobby_Carrot/train_dqn.py \
+  --level 5 \
+  --episodes 8000 \
+  --warmup-eps 80 \
+  --n-envs 8 \
+  --model-path "dqn_checkpoints/dqn_normal5.pt" \
+  --ckpt-dir "dqn_checkpoints" \
+  --report-every 100 \
+  --save-every 500
+
+
+==================    COMBINED LEVEL TRAINING (LEVELS 3-5 TOGETHER)    ==================
+
+Train on all three levels simultaneously with curriculum weighting.
+The agent automatically focuses more on levels it's failing at.
+THIS IS RECOMMENDED for best generalisation.
+
+python Bobby_Carrot/train_dqn.py \
+  --levels "3-5" \
+  --episodes 10000 \
+  --warmup-eps 80 \
+  --n-envs 8 \
+  --model-path "dqn_checkpoints/dqn_normal3_5.pt" \
+  --ckpt-dir "dqn_checkpoints" \
+  --report-every 100 \
+  --save-every 500
+
+
+==================    SEQUENTIAL FINE-TUNING (BEST TRANSFER STRATEGY)    ==================
+
+Train on L3 first, then fine-tune the result on L4, then on L5.
+Each stage inherits skills from previous levels.
+BETTER THAN NAIVE MERGE for individual-to-combined transfer.
+
+# Step 1: Train L3 from scratch
+python Bobby_Carrot/train_dqn.py \
+  --level 3 --episodes 5000 \
+  --model-path "dqn_checkpoints/dqn_seq_L3.pt"
+
+# Step 2: Fine-tune L3 model on L4 
+python Bobby_Carrot/train_dqn.py \
+  --level 4 --episodes 5000 \
+  --resume --model-path "dqn_checkpoints/dqn_seq_L3_best.pt" \
+  --ckpt-dir "dqn_checkpoints"
+
+# Step 3: Fine-tune L3+L4 model on L5
+python Bobby_Carrot/train_dqn.py \
+  --level 5 --episodes 5000 \
+  --resume --model-path "dqn_checkpoints/dqn_normal4_best.pt" \
+  --ckpt-dir "dqn_checkpoints"
+
+# Step 4: Final joint fine-tune on all 3 levels (polish)
+python Bobby_Carrot/train_dqn.py \
+  --levels "3-5" --episodes 3000 \
+  --resume --model-path "dqn_checkpoints/dqn_normal5_best.pt" \
+  --ckpt-dir "dqn_checkpoints" \
+  --model-path "dqn_checkpoints/dqn_seq_L3_5_final.pt"
+
+
+==================    MODEL MERGING (INDIVIDUAL → COMBINED)    ==================
+
+IMPORTANT: Naive weight merging usually degrades performance because
+each model converged to a different region of parameter space.
+ALWAYS fine-tune after merging!
+
+# Option A: Weight averaging (then MUST fine-tune)
+python Bobby_Carrot/merge_models.py \
+  --mode average \
+  --models dqn_checkpoints/dqn_normal3_best.pt \
+           dqn_checkpoints/dqn_normal4_best.pt \
+           dqn_checkpoints/dqn_normal5_best.pt \
+  --output dqn_checkpoints/dqn_level3_5_averaged.pt
+
+# REQUIRED: Fine-tune the averaged model on all levels
+python Bobby_Carrot/train_dqn.py \
+  --levels "3-5" --episodes 3000 \
+  --resume --model-path dqn_checkpoints/dqn_level3_5_averaged.pt
+
+# Option B: Sequential merge (just uses the last model)
+python Bobby_Carrot/merge_models.py \
+  --mode sequential \
+  --models dqn_checkpoints/dqn_normal3_best.pt \
+           dqn_checkpoints/dqn_normal4_best.pt \
+           dqn_checkpoints/dqn_normal5_best.pt \
+  --output dqn_checkpoints/dqn_level3_5_sequential.pt
+
+
 ==================    COLAB T4 TRAINING – RAINBOW DQN (LEVELS 3 TO 5)    ==================
 
 Because we just upgraded the agent to a "Rainbow-lite" architecture (PER + N-step + Count-based exploration), the agent is now powerful enough to learn generalized maze navigation. We can train it on levels 3, 4, and 5 simultaneously!
@@ -83,12 +199,25 @@ Because we just upgraded the agent to a "Rainbow-lite" architecture (PER + N-ste
 !pip install torch pygame numpy -q
 from google.colab import drive; drive.mount('/content/drive', force_remount=True)
 
+# Verify Checkpoints Save or Not
+from pathlib import Path
+Path("dqn_checkpoints").exists()
+Path("/content/drive/MyDrive/bobby_models/L3_5").exists()
+
+from pathlib import Path
+list(Path("dqn_checkpoints").glob(".pt"))
+list(Path("/content/drive/MyDrive/bobby_models/L3_5").glob(".pt"))
+
+for p in Path("/content/drive/MyDrive/bobby_models/L3_5").glob("*.pt"):
+print(p.name, p.stat().st_size)
+
+
 # Generalized Training (Levels 3, 4, and 5 together)
 # This will take longer (e.g., 6000-8000 episodes) but produces a much smarter agent.
 !python Bobby_Carrot/train_dqn.py \
   --levels "3-5" \
-  --episodes 8000 \
-  --warmup-eps 50 \
+  --episodes 10000 \
+  --warmup-eps 80 \
   --n-envs 8 \
   --model-path "/content/drive/MyDrive/bobby_models/L3_5/dqn_normal3_5.pt" \
   --ckpt-dir "dqn_checkpoints" \
@@ -99,8 +228,8 @@ from google.colab import drive; drive.mount('/content/drive', force_remount=True
 # To Resume Generalized Training (if interrupted)
 !python Bobby_Carrot/train_dqn.py \
   --levels "3-5" \
-  --episodes 8000 \
-  --warmup-eps 50 \
+  --episodes 10000 \
+  --warmup-eps 80 \
   --n-envs 8 \
   --resume \
   --model-path "/content/drive/MyDrive/bobby_models/L3_5/dqn_normal3_5.pt" \
@@ -127,4 +256,23 @@ python Bobby_Carrot/train_dqn.py --play-gui --level 5 --model-path ".\Bobby_Carr
 1. Save to Google Drive – Colab runtime can disconnect.
 2. Use --resume ONLY if training was interrupted.
 3. The new code uses NoisyNets automatically instead of epsilon-greedy.
+
+==================    INDIVIDUAL vs COMBINED TRAINING COMPARISON    ==================
+
+┌────────────────────┬──────────────────────┬──────────────────────┐
+│ Criterion          │ Individual Training  │ Combined Training    │
+├────────────────────┼──────────────────────┼──────────────────────┤
+│ Speed per level    │ ✅ Faster (focused)  │ ⚠️ Slower (shared)   │
+│ Level mastery      │ ✅ Higher per-level  │ ⚠️ Good but slower   │
+│ Generalisation     │ ❌ None (per-level)  │ ✅ Learns patterns   │
+│ Risk of overfit    │ ❌ High (1 level)    │ ✅ Low (many levels)  │
+│ Model count        │ ❌ N separate files  │ ✅ One model          │
+│ Transfer to L6+    │ ❌ No transfer       │ ✅ Good transfer      │
+│ Merge required?    │ ❌ Yes, risky        │ ✅ No, ready to use   │
+└────────────────────┴──────────────────────┴──────────────────────┘
+
+RECOMMENDATION:
+  Combined training ("--levels 3-5") is BEST for levels 3-5.
+  If you must train individually, use Sequential Fine-Tuning
+  (L3 → L4 → L5 → joint polish) instead of naive weight averaging.
 

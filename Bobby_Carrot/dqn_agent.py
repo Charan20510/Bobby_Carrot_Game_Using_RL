@@ -81,22 +81,41 @@ class DQNAgent:
     def _unwrapped_target(self) -> nn.Module:
         return getattr(self.target, '_orig_mod', self.target)
 
-    def act(self, grid: np.ndarray, inv: np.ndarray) -> int:
-        """Single-observation action selection (used during play/eval)."""
+    def act(self, grid: np.ndarray, inv: np.ndarray,
+             valid_mask: Optional[np.ndarray] = None) -> int:
+        """Single-observation action selection (used during play/eval).
+
+        Args:
+            valid_mask: optional float32 mask (4,) — 1.0 for valid actions.
+                        If provided, invalid actions are masked out of Q-values.
+        """
         if random.random() < self.epsilon:
+            if valid_mask is not None:
+                valid_indices = np.where(valid_mask > 0.5)[0]
+                if len(valid_indices) > 0:
+                    return int(random.choice(valid_indices))
             return random.randint(0, N_ACTIONS - 1)
         self.policy.reset_noise()
         g = torch.from_numpy(grid).unsqueeze(0).to(self.device, non_blocking=True)
         v = torch.from_numpy(inv).unsqueeze(0).to(self.device, non_blocking=True)
         with torch.no_grad():
-            return int(self._unwrapped_policy(g, v).argmax(1).item())
+            q = self._unwrapped_policy(g, v)
+            if valid_mask is not None:
+                mask_t = torch.from_numpy(valid_mask).unsqueeze(0).to(self.device)
+                q = q.masked_fill(mask_t < 0.5, -1e9)
+            return int(q.argmax(1).item())
 
-    def act_batch(self, grids: List[np.ndarray], invs: List[np.ndarray]
+    def act_batch(self, grids: List[np.ndarray], invs: List[np.ndarray],
+                  valid_masks: Optional[List[np.ndarray]] = None
                   ) -> List[int]:
         """Batched inference — process all N environments in a single GPU pass.
 
         ~4-6× faster than N separate act() calls on GPU.
         Returns a list of greedy actions (noise provides exploration via NoisyNet).
+
+        Args:
+            valid_masks: optional list of float32 masks (4,) per env.
+                         If provided, invalid actions are masked out.
         """
         self.policy.reset_noise()
         n = len(grids)
@@ -104,6 +123,9 @@ class DQNAgent:
         v = torch.from_numpy(np.stack(invs)).to(self.device, non_blocking=True)
         with torch.no_grad():
             q_values = self._unwrapped_policy(g, v)  # (n, N_ACTIONS)
+            if valid_masks is not None:
+                m = torch.from_numpy(np.stack(valid_masks)).to(self.device)
+                q_values = q_values.masked_fill(m < 0.5, -1e9)
             best_actions = q_values.argmax(1).cpu().numpy()
         return [int(best_actions[i]) for i in range(n)]
 

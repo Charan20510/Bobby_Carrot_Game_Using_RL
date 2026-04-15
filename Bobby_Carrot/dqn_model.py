@@ -86,8 +86,13 @@ class NoisyLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.training:
-            weight = self.mu_weight + self.sigma_weight * self.epsilon_weight
-            bias = self.mu_bias + self.sigma_bias * self.epsilon_bias
+            # Floor sigma at 0.01 to prevent exploration collapse
+            # (without this, training on crumble levels drives sigma → 0,
+            #  causing complete paralysis on new levels like L5)
+            sigma_w = torch.clamp(self.sigma_weight, min=0.01)
+            sigma_b = torch.clamp(self.sigma_bias, min=0.01)
+            weight = self.mu_weight + sigma_w * self.epsilon_weight
+            bias = self.mu_bias + sigma_b * self.epsilon_bias
         else:
             weight = self.mu_weight
             bias = self.mu_bias

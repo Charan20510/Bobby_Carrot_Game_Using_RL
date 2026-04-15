@@ -290,6 +290,10 @@ def train(
     warmup_done = False
 
     tag = f"L{min(level_pool)}-{max(level_pool)}" if multi else f"L{level_pool[0]}"
+
+    # Per-level success tracking for curriculum weighting
+    level_sr: Dict[int, float] = {lvl: 0.5 for lvl in level_pool}
+
     print(f"\n=== Training {tag} for {n_episodes} episodes "
           f"(ep {total_eps}->{target_eps}) ===")
     if noisy:
@@ -309,10 +313,11 @@ def train(
         return targets
 
     while total_eps < target_eps:
-        # ── BATCHED observation collection ────────────────────────────────
+        # ── BATCHED observation + action mask collection ────────────────
         obs_pairs = [env.get_obs() for env in envs]
         grids = [p[0] for p in obs_pairs]
         invs  = [p[1] for p in obs_pairs]
+        masks = [env.get_valid_actions() for env in envs]
 
         # ── Action selection ──────────────────────────────────────────────
         in_warmup = total_eps < warmup_eps
@@ -320,25 +325,35 @@ def train(
         if in_warmup:
             # Warmup: mostly BFS-guided (70%) to fill replay buffer
             actions = []
-            for env in envs:
+            for ei, env in enumerate(envs):
                 if random.random() < 0.7:
                     actions.append(_bfs_best_action(env))
                 else:
-                    actions.append(random.randint(0, N_ACTIONS - 1))
+                    # Random among VALID actions only
+                    valid_idx = np.where(masks[ei] > 0.5)[0]
+                    if len(valid_idx) > 0:
+                        actions.append(int(random.choice(valid_idx)))
+                    else:
+                        actions.append(random.randint(0, N_ACTIONS - 1))
         else:
             if not warmup_done:
                 warmup_done = True
                 print(f"  [warmup done] Switching to {'NoisyNet' if noisy else 'ε-greedy'} exploration")
 
-            # NoisyNet: use policy (noise provides exploration), plus a 2% safety net
+            # NoisyNet: use policy (noise provides exploration), plus a 5% safety net
             # ε-greedy fallback: use current epsilon for exploration
-            policy_actions = agent.act_batch(grids, invs)
+            policy_actions = agent.act_batch(grids, invs, valid_masks=masks)
 
             actions = []
-            cur_eps = agent.epsilon if not noisy else max(0.02, agent.epsilon)
+            cur_eps = agent.epsilon if not noisy else max(0.05, agent.epsilon)
             for i, env in enumerate(envs):
                 if random.random() < cur_eps:
-                    actions.append(random.randint(0, N_ACTIONS - 1))
+                    # Random among valid actions
+                    valid_idx = np.where(masks[i] > 0.5)[0]
+                    if len(valid_idx) > 0:
+                        actions.append(int(random.choice(valid_idx)))
+                    else:
+                        actions.append(random.randint(0, N_ACTIONS - 1))
                 else:
                     actions.append(policy_actions[i])
 
@@ -366,11 +381,18 @@ def train(
                 completed_win.append(1.0 if env.finished else 0.0)
                 total_eps += 1
 
+                # Update per-level success rate (EMA)
+                lvl_id = env.map_number
+                if lvl_id in level_sr:
+                    level_sr[lvl_id] = 0.95 * level_sr[lvl_id] + 0.05 * (1.0 if env.finished else 0.0)
+
                 if not noisy and total_eps > warmup_eps:
                     agent.epsilon = max(eps_min, agent.epsilon * eps_decay)
 
                 if multi:
-                    env.set_level(random.choice(level_pool))
+                    # Curriculum: oversample levels agent is worst at
+                    weights = [1.0 / max(0.05, level_sr.get(l, 0.5)) for l in level_pool]
+                    env.set_level(random.choices(level_pool, weights=weights, k=1)[0])
                 env.reset()
 
         env_steps += n_envs
@@ -520,7 +542,8 @@ def play(
             done  = False
             steps = 0
             while not done:
-                a = agent.act(g, v)
+                vm = env.get_valid_actions()
+                a = agent.act(g, v, valid_mask=vm)
                 _, done, _ = env.step(a)
                 g, v = env.get_obs()
                 steps += 1
@@ -624,7 +647,8 @@ def play_gui(
                 and not done
                 and bobby.state not in (State.FadeIn, State.FadeOut, State.Death)):
                 if now_ms - getattr(bobby, '_last_ai_ms', 0) >= AI_MOVE_COOLDOWN_MS:
-                    action = agent.act(g, v)
+                    vm = env.get_valid_actions()
+                    action = agent.act(g, v, valid_mask=vm)
                     _, env_done, env_won = env.step(action)
                     g, v = env.get_obs()
                     steps_taken += 1

@@ -34,7 +34,7 @@ from bobby_carrot.game import Map, MapInfo  # type: ignore[missing-import] # noq
 # ── Constants ─────────────────────────────────────────────────────────────────
 N_ACTIONS = 4
 GRID_CHANNELS = 14  # 10 semantic + agent_pos + visited + direction_hint + collected_memory
-INV_FEATURES = 8
+INV_FEATURES = 10   # was 8; added safe_ratio + unsafe_ratio for crumble-ordering
 
 # ── Tile class lookup table ───────────────────────────────────────────────────
 # 0=wall  1=floor  2=carrot  3=egg  4=finish-inactive  5=finish-active
@@ -240,6 +240,8 @@ class BobbyEnv:
         self._stall_limit = 150
         # Collection tracking
         self._steps_since_collect = 0
+        # Crumble-crossing tracking
+        self._section_cleared_bonus_given = False
 
     def set_level(self, level: int) -> None:
         """Switch to a different level (for multi-level training). Call reset() after."""
@@ -276,11 +278,12 @@ class BobbyEnv:
         self._obs_dirty  = True
         self._cached_grid = None
         self._cached_inv  = None
-        # Stall
+        # Stall — tighter limit to prevent L5‐style paralysis
         self._stall_steps = 0
-        self._stall_limit = max(200, self.max_steps // 2)
+        self._stall_limit = max(80, self.max_steps // 4)
         # Collection tracking
         self._steps_since_collect = 0
+        self._section_cleared_bonus_given = False
         # Compute initial BFS + reachability
         bfs, bfs_safe = self._get_bfs_pair()
         self._prev_reachable = _count_reachable(bfs, self.md)
@@ -339,7 +342,7 @@ class BobbyEnv:
         to_idx   = nx + ny * 16
         t_from   = int(self.md[from_idx])
         t_to     = int(self.md[to_idx])
-        reward   = -0.05  # stronger step penalty for efficiency
+        reward   = -0.05  # step penalty for efficiency
         collected = False
 
         # ── Leaving tile mutations ────────────────────────────────────────
@@ -360,13 +363,13 @@ class BobbyEnv:
             self.md[to_idx] = 20
             self.n_collected += 1
             self._collected_positions[to_idx] = 1.0  # remember where we collected
-            reward += 8.0  # stronger collection signal
+            reward += 5.0  # reduced from 8.0 to tame greedy collection
             collected = True
         elif t_to == 45:  # egg
             self.md[to_idx] = 46
             self.n_collected += 1
             self._collected_positions[to_idx] = 1.0
-            reward += 8.0
+            reward += 5.0
             collected = True
         elif t_to == 32:  # gray key
             self.md[to_idx] = 18; self.key_gray   += 1
@@ -385,9 +388,19 @@ class BobbyEnv:
         elif t_to == 38:  # blue switch
             _apply_lut(self.md, _LUT_BLU_F, _LUT_BLU_T)
 
-        # ── Crumble-crossing penalty (irreversible move) ──────────────────
+        # ── Proactive crumble-stranding check ("look before you leap") ────
         if t_from == 30:  # just left a crumble tile — it collapses behind us
-            reward -= 0.5  # cost for irreversible move
+            reward -= 0.5  # base cost for irreversible move
+            # Simulate post-collapse reachability
+            remaining_after = int(np.sum((self.md == 19) | (self.md == 45)))
+            if remaining_after > 0:
+                sim_md = self.md.copy()
+                sim_md[from_idx] = 31  # simulate collapse
+                sim_bfs, _ = _bfs_unified(sim_md, to_idx)
+                sim_reachable = _count_reachable(sim_bfs, sim_md)
+                will_strand = max(0, remaining_after - sim_reachable)
+                if will_strand > 0:
+                    reward -= 5.0 * will_strand  # STRONG preventive penalty
 
         # ── Undo-move penalty (anti-oscillation) ─────────────────────────
         is_undo = (self._prev_pos is not None and (nx, ny) == self._prev_pos)
@@ -418,7 +431,7 @@ class BobbyEnv:
         # ── Win condition ─────────────────────────────────────────────────
         if t_to == 44 and self.n_collected == self.n_targets:
             self.finished = True
-            return reward + 50.0, True, True
+            return reward + 80.0, True, True  # boosted from 50.0
 
         # ── Collection efficiency bonus ───────────────────────────────────
         if collected and self.n_targets > 0:
@@ -432,7 +445,7 @@ class BobbyEnv:
 
             # Milestone bonuses
             if self.n_collected == self.n_targets:
-                reward += 15.0  # all targets collected — strong signal
+                reward += 25.0  # all targets collected — very strong signal (was 15)
             elif progress >= 0.75 and (self.n_collected - 1) / self.n_targets < 0.75:
                 reward += 3.0   # 75% milestone
             elif progress >= 0.50 and (self.n_collected - 1) / self.n_targets < 0.50:
@@ -454,16 +467,26 @@ class BobbyEnv:
             if reachable == 0:
                 return reward - 30.0, True, False
 
-            # ── Crumble-stranding penalty (proactive) ─────────────────────
-            # Penalise when crossing a crumble reduces safe-reachable targets
-            # (softer than full-unreachable, gives earlier gradient signal)
+            # ── Crumble-stranding penalty (reactive fallback) ──────────────
             safe_reachable = _count_reachable(bfs_safe, self.md)
             expected_safe = self._prev_safe_reachable - (1 if collected else 0)
             safe_lost = max(0, expected_safe - safe_reachable)
             if safe_lost > 0 and t_from == 30:
-                # Agent crossed a crumble and stranded targets on old side
                 reward -= 2.0 * safe_lost
             self._prev_safe_reachable = safe_reachable
+
+            # ── Section-completion bonus ──────────────────────────────────
+            # Reward clearing ALL carrots in the current crumble-safe section
+            # before crossing to the next section.
+            if collected and not self._section_cleared_bonus_given:
+                safe_targets = int(np.sum(
+                    ((self.md == 19) | (self.md == 45)) & (bfs_safe >= 0)))
+                if safe_targets == 0 and self.n_collected < self.n_targets:
+                    reward += 5.0  # cleared entire current section
+                    self._section_cleared_bonus_given = True
+            # Reset section flag when entering a new section
+            if t_from == 30:
+                self._section_cleared_bonus_given = False
         else:
             self._prev_reachable = 0
             self._prev_safe_reachable = 0
@@ -510,8 +533,17 @@ class BobbyEnv:
         _, bfs_safe = self._get_bfs_pair()
         return bfs_safe
 
+    def get_valid_actions(self) -> np.ndarray:
+        """Return float32 mask of valid actions (4,). Used for action masking."""
+        px, py = self.pos
+        mask = np.zeros(N_ACTIONS, dtype=np.float32)
+        for a, (dx, dy) in enumerate(ACTION_DELTA):
+            if self._can_move(px, py, dx, dy):
+                mask[a] = 1.0
+        return mask
+
     def get_obs(self) -> Tuple[np.ndarray, np.ndarray]:
-        """14-channel grid + 8-dim inventory vector."""
+        """14-channel grid + 10-dim inventory vector."""
         if not self._obs_dirty and self._cached_grid is not None:
             return self._cached_grid, self._cached_inv  # type: ignore[return-value]
 
@@ -579,8 +611,9 @@ class BobbyEnv:
         # Helps the agent avoid revisiting already-cleared locations.
         grid[13] = self._collected_positions.reshape(16, 16)
 
-        # Inventory vector (8 features)
+        # Inventory vector (10 features — was 8)
         n_rem     = self.n_targets - self.n_collected
+        remaining = int(np.sum((self.md == 19) | (self.md == 45)))
         rem       = float(n_rem) / max(1.0, float(self.n_targets))
         dist_n    = min(1.0, bfs_to_target / 32.0)
         phase     = 1.0 if all_done else 0.0
@@ -591,8 +624,15 @@ class BobbyEnv:
                      if n_rem > 0 else 1.0)
         steps_rem = 1.0 - float(self.step_count) / max(1.0, float(self.max_steps))
 
+        # NEW: safe vs unsafe target ratios for crumble-ordering decisions
+        safe_targets  = int(np.sum(((self.md == 19) | (self.md == 45)) & (bfs_safe >= 0)))
+        unsafe_targets = max(0, remaining - safe_targets)
+        safe_ratio  = float(safe_targets)  / max(1.0, float(remaining)) if remaining > 0 else 1.0
+        unsafe_ratio = float(unsafe_targets) / max(1.0, float(remaining)) if remaining > 0 else 0.0
+
         inv = np.array([rem, dist_n, phase, progress, has_key, visit_rat,
-                        reach_rat, steps_rem], dtype=np.float32)
+                        reach_rat, steps_rem, safe_ratio, unsafe_ratio],
+                       dtype=np.float32)
 
         self._cached_grid = grid
         self._cached_inv  = inv
